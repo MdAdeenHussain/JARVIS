@@ -19,9 +19,15 @@ This version is designed around five core ideas:
 import datetime
 import itertools
 import logging
+import math
+import mimetypes
+import operator
 import os
 import queue
+import random
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -34,6 +40,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
+
+import ast
 
 try:
     from dotenv import load_dotenv
@@ -72,6 +80,74 @@ except ImportError:
     psycopg2 = None
     SimpleConnectionPool = None
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    import pyautogui
+
+    pyautogui.FAILSAFE = True
+except ImportError:
+    pyautogui = None
+
+try:
+    import pyperclip
+except ImportError:
+    pyperclip = None
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    from send2trash import send2trash
+except ImportError:
+    send2trash = None
+
+try:
+    from PyQt6.QtCore import (
+        QEasingCurve,
+        QObject,
+        QPauseAnimation,
+        QPropertyAnimation,
+        QRectF,
+        Qt,
+        QTimer,
+        pyqtProperty,
+        pyqtSignal,
+    )
+    from PyQt6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPainterPath, QPen
+    from PyQt6.QtWidgets import QApplication, QGraphicsOpacityEffect, QWidget
+except ImportError:
+    QApplication = None
+    QColor = None
+    QFont = None
+    QGraphicsOpacityEffect = None
+    QGuiApplication = None
+    QObject = object
+    QPainter = None
+    QPainterPath = None
+    QPauseAnimation = None
+    QPen = None
+    QPropertyAnimation = None
+    QRectF = None
+    Qt = None
+    QTimer = None
+    QEasingCurve = None
+    QWidget = object
+
+    def pyqtProperty(*args: Any, **kwargs: Any) -> Any:
+        def decorator(function: Any) -> Any:
+            return function
+
+        return decorator
+
+    def pyqtSignal(*args: Any, **kwargs: Any) -> Any:
+        return None
+
 
 # ══════════════════════════════════════════════════════════
 # ██  ENVIRONMENT & CONFIG LOADER
@@ -80,6 +156,9 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 LOG_PATH = BASE_DIR / "jarvis.log"
+JARVIS_VERSION = "2.0.0"
+JARVIS_BUILD_DATE = "2026-03-15"
+NOTES_PATH = Path("~/Desktop/jarvis_notes.txt").expanduser()
 
 SYSTEM_PROMPT = (
     "You are JARVIS, a highly intelligent, concise, and witty AI assistant inspired by Iron Man. "
@@ -126,9 +205,10 @@ class AppConfig:
         db_password (str): PostgreSQL password.
         db_port (int): PostgreSQL port number.
         wake_word (str): Wake word JARVIS listens for.
-        voice_rate (int): Text-to-speech speaking rate.
-        history_limit (int): Maximum number of provider-specific history messages to retain.
-        primary_ai (str): Preferred AI provider at startup.
+    voice_rate (int): Text-to-speech speaking rate.
+    history_limit (int): Maximum number of provider-specific history messages to retain.
+    primary_ai (str): Preferred AI provider at startup.
+    ui_mode (str): Presentation mode such as `both`, `terminal`, or `overlay`.
 
     Returns:
         None.
@@ -145,6 +225,7 @@ class AppConfig:
     voice_rate: int
     history_limit: int
     primary_ai: str
+    ui_mode: str
 
 
 def parse_int_env(key: str, fallback: int) -> int:
@@ -206,6 +287,11 @@ def load_and_validate_environment() -> Optional[AppConfig]:
     if primary_ai not in {"gemini", "groq"}:
         primary_ai = "gemini"
 
+    # ── normalize the requested UI mode and fall back safely when invalid ──
+    ui_mode = os.getenv("UI_MODE", "both").strip().lower()
+    if ui_mode not in {"both", "terminal", "overlay"}:
+        ui_mode = "both"
+
     # ── build the validated runtime configuration object ──
     return AppConfig(
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
@@ -219,6 +305,7 @@ def load_and_validate_environment() -> Optional[AppConfig]:
         voice_rate=parse_int_env("VOICE_RATE", 175),
         history_limit=max(1, parse_int_env("HISTORY_LIMIT", 10)),
         primary_ai=primary_ai,
+        ui_mode=ui_mode,
     )
 
 
@@ -1188,6 +1275,952 @@ class JarvisAnimator:
             time.sleep(0.1)
 
 
+# ─═════════════════════════════════════════════════════════
+# ██  OVERLAY UI — PYQT6
+# ══════════════════════════════════════════════════════════
+
+
+if QApplication is not None and QPropertyAnimation is not None:
+
+    class UIBridge(QObject):
+        """
+        Connect the voice pipeline to the PyQt overlay using queued signals only.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This class does not raise exceptions directly.
+        """
+
+        state_signal = pyqtSignal(str)
+        text_signal = pyqtSignal(str)
+        provider_signal = pyqtSignal(str)
+        stop_signal = pyqtSignal()
+
+    class JarvisOverlay(QWidget):
+        """
+        Render the floating JARVIS overlay window on a dedicated Qt thread.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This class keeps UI failures local so the assistant can fall back safely.
+        """
+
+        def __init__(self) -> None:
+            """
+            Initialize the overlay window, drawing state, and animations.
+
+            Parameters:
+                None.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This constructor does not raise exceptions intentionally.
+            """
+            super().__init__()
+            self.current_state = "idle"
+            self.display_text = ""
+            self.provider_name = "gemini"
+            self.pulse_phase_value = 0.0
+            self.spin_angle_value = 0.0
+            self.text_opacity_value = 0.0
+            self.bar_values = [8.0, 12.0, 18.0, 10.0, 14.0]
+            self.idle_minimum_opacity = 0.15
+            self.active_opacity = 1.0
+            self.error_color = QColor("#FF4D6A")
+            self.accent_color = QColor("#6C63FF")
+            self.text_color = QColor("#E8E8F0")
+            self.idle_timer = QTimer(self)
+            self.idle_timer.setSingleShot(True)
+            self.idle_timer.timeout.connect(self.fade_to_idle)
+            self.setup_window()
+            self.setup_animations()
+            self.setup_ui()
+            self.apply_state("idle", "")
+
+        def setup_window(self) -> None:
+            """
+            Configure the floating frameless window.
+
+            Parameters:
+                None.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            # ── NEW ── frameless floating overlay with a translucent background ──
+            self.setWindowFlags(
+                Qt.WindowType.Tool
+                | Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.WindowDoesNotAcceptFocus
+            )
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            self.setFixedSize(460, 110)
+            self.opacity_effect = QGraphicsOpacityEffect(self)
+            self.opacity_effect.setOpacity(self.idle_minimum_opacity)
+            self.setGraphicsEffect(self.opacity_effect)
+            self.reposition()
+
+        def setup_animations(self) -> None:
+            """
+            Build the reusable state animations.
+
+            Parameters:
+                None.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            # ── NEW ── cross-fade the overlay between visible states and idle ──
+            self.opacity_animation = QPropertyAnimation(self.opacity_effect, b"opacity", self)
+            self.opacity_animation.setDuration(300)
+            self.opacity_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+            self.text_opacity_animation = QPropertyAnimation(self, b"textOpacity", self)
+            self.text_opacity_animation.setDuration(300)
+            self.text_opacity_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+            self.pulse_animation = QPropertyAnimation(self, b"pulsePhase", self)
+            self.pulse_animation.setStartValue(0.0)
+            self.pulse_animation.setEndValue(1.0)
+            self.pulse_animation.setDuration(800)
+            self.pulse_animation.setLoopCount(-1)
+            self.pulse_animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+
+            self.spin_animation = QPropertyAnimation(self, b"spinAngle", self)
+            self.spin_animation.setStartValue(0.0)
+            self.spin_animation.setEndValue(360.0)
+            self.spin_animation.setDuration(1200)
+            self.spin_animation.setLoopCount(-1)
+            self.spin_animation.setEasingCurve(QEasingCurve.Type.Linear)
+
+            self.bar_animations: List[QPropertyAnimation] = []
+            for index in range(5):
+                animation = QPropertyAnimation(self, f"barLevel{index}".encode("utf-8"), self)
+                animation.setStartValue(4.0)
+                animation.setEndValue(24.0)
+                animation.setDuration(random.randint(200, 600))
+                animation.setLoopCount(-1)
+                animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+                self.bar_animations.append(animation)
+
+            self.error_pulse_animation = QPropertyAnimation(self.opacity_effect, b"opacity", self)
+            self.error_pulse_animation.setDuration(450)
+            self.error_pulse_animation.setKeyValueAt(0.0, 1.0)
+            self.error_pulse_animation.setKeyValueAt(0.5, 0.55)
+            self.error_pulse_animation.setKeyValueAt(1.0, 1.0)
+
+        def setup_ui(self) -> None:
+            """
+            Finalize the initial overlay state and show the widget.
+
+            Parameters:
+                None.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            self.show()
+
+        def reposition(self) -> None:
+            """
+            Move the overlay to the bottom center of the active screen.
+
+            Parameters:
+                None.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            screen = QGuiApplication.primaryScreen()
+            if screen is None:
+                return
+            geometry = screen.availableGeometry()
+            x_pos = geometry.x() + (geometry.width() - self.width()) // 2
+            y_pos = geometry.y() + geometry.height() - self.height() - 40
+            self.move(x_pos, y_pos)
+
+        def stop_all_state_animations(self) -> None:
+            """
+            Stop every active state animation before switching visuals.
+
+            Parameters:
+                None.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            self.pulse_animation.stop()
+            self.spin_animation.stop()
+            for animation in self.bar_animations:
+                animation.stop()
+
+        def animate_opacity(self, target_opacity: float) -> None:
+            """
+            Animate the overlay opacity to the requested level.
+
+            Parameters:
+                target_opacity (float): Desired final opacity.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            self.opacity_animation.stop()
+            self.opacity_animation.setStartValue(self.opacity_effect.opacity())
+            self.opacity_animation.setEndValue(target_opacity)
+            self.opacity_animation.start()
+
+        def apply_state(self, state: str, text: str = "") -> None:
+            """
+            Update the active visual state and associated text.
+
+            Parameters:
+                state (str): One of `idle`, `listening`, `thinking`, `speaking`, or `error`.
+                text (str): Optional display text.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            normalized_state = state if state in {"idle", "listening", "thinking", "speaking", "error"} else "idle"
+            self.current_state = normalized_state
+            if text:
+                self.display_text = text[:40] + ("..." if len(text) > 40 else "")
+            elif normalized_state in {"listening", "thinking"}:
+                self.display_text = f"{normalized_state.title()}..."
+            elif normalized_state == "idle":
+                self.display_text = ""
+
+            self.stop_all_state_animations()
+            self.idle_timer.stop()
+
+            if normalized_state == "idle":
+                self.text_opacity_animation.stop()
+                self.text_opacity_animation.setStartValue(self.text_opacity_value)
+                self.text_opacity_animation.setEndValue(0.0)
+                self.text_opacity_animation.start()
+                self.idle_timer.start(4000)
+            elif normalized_state == "listening":
+                self.animate_opacity(self.active_opacity)
+                self.text_opacity_animation.stop()
+                self.text_opacity_animation.setStartValue(self.text_opacity_value)
+                self.text_opacity_animation.setEndValue(1.0)
+                self.text_opacity_animation.start()
+                self.pulse_animation.start()
+            elif normalized_state == "thinking":
+                self.animate_opacity(self.active_opacity)
+                self.text_opacity_animation.stop()
+                self.text_opacity_animation.setStartValue(self.text_opacity_value)
+                self.text_opacity_animation.setEndValue(1.0)
+                self.text_opacity_animation.start()
+                self.spin_animation.start()
+            elif normalized_state == "speaking":
+                self.animate_opacity(self.active_opacity)
+                self.text_opacity_animation.stop()
+                self.text_opacity_animation.setStartValue(self.text_opacity_value)
+                self.text_opacity_animation.setEndValue(1.0)
+                self.text_opacity_animation.start()
+                for animation in self.bar_animations:
+                    animation.start()
+            elif normalized_state == "error":
+                self.animate_opacity(self.active_opacity)
+                self.text_opacity_animation.stop()
+                self.text_opacity_animation.setStartValue(self.text_opacity_value)
+                self.text_opacity_animation.setEndValue(1.0)
+                self.text_opacity_animation.start()
+                for animation in self.bar_animations:
+                    animation.start()
+                self.error_pulse_animation.start()
+                QTimer.singleShot(2000, lambda: self.apply_state("idle", ""))
+
+            self.update()
+
+        def fade_to_idle(self) -> None:
+            """
+            Fade the overlay down to its low-opacity idle appearance.
+
+            Parameters:
+                None.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            if self.current_state == "idle":
+                self.animate_opacity(self.idle_minimum_opacity)
+                self.update()
+
+        def on_state_changed(self, state: str) -> None:
+            """
+            Receive a queued state change from the voice pipeline.
+
+            Parameters:
+                state (str): New overlay state.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            self.apply_state(state, "")
+
+        def on_text_changed(self, text: str) -> None:
+            """
+            Receive new display text from the voice pipeline.
+
+            Parameters:
+                text (str): Text to render in the overlay.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            self.display_text = text[:40] + ("..." if len(text) > 40 else "")
+            self.text_opacity_animation.stop()
+            self.text_opacity_animation.setStartValue(0.0)
+            self.text_opacity_animation.setEndValue(1.0)
+            self.text_opacity_animation.start()
+            self.update()
+
+        def on_provider_changed(self, provider: str) -> None:
+            """
+            Receive a provider-label update from the voice pipeline.
+
+            Parameters:
+                provider (str): Provider name such as `gemini` or `groq`.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            self.provider_name = provider.strip().lower() or "gemini"
+            self.update()
+
+        def on_stop_requested(self) -> None:
+            """
+            Close the overlay when the application is shutting down.
+
+            Parameters:
+                None.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            self.close()
+
+        def draw_background(self, painter: QPainter) -> None:
+            """
+            Draw the rounded frosted-glass shell.
+
+            Parameters:
+                painter (QPainter): Active widget painter.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            outer_rect = self.rect().adjusted(4, 4, -4, -4)
+            background_path = QPainterPath()
+            background_path.addRoundedRect(QRectF(outer_rect), 34, 34)
+            painter.fillPath(background_path, QColor(13, 13, 15, 224))
+
+            border_pen = QPen(QColor(108, 99, 255, 70), 1.2)
+            painter.setPen(border_pen)
+            painter.drawPath(background_path)
+
+        def draw_idle(self, painter: QPainter) -> None:
+            """
+            Draw the idle glowing dot.
+
+            Parameters:
+                painter (QPainter): Active widget painter.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            center_x = self.width() // 2
+            center_y = self.height() // 2
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(108, 99, 255, 75))
+            painter.drawEllipse(center_x - 12, center_y - 12, 24, 24)
+            painter.setBrush(self.accent_color)
+            painter.drawEllipse(center_x - 4, center_y - 4, 8, 8)
+
+        def draw_microphone(self, painter: QPainter) -> None:
+            """
+            Draw a simple microphone icon for the listening state.
+
+            Parameters:
+                painter (QPainter): Active widget painter.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            painter.save()
+            painter.setPen(QPen(self.text_color, 2))
+            painter.drawRoundedRect(32, 30, 12, 24, 6, 6)
+            painter.drawLine(38, 54, 38, 64)
+            painter.drawArc(28, 44, 20, 20, 0, -180 * 16)
+            painter.drawLine(30, 64, 46, 64)
+            painter.restore()
+
+        def draw_listening(self, painter: QPainter) -> None:
+            """
+            Draw the pulsing listening rings.
+
+            Parameters:
+                painter (QPainter): Active widget painter.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            center_x = self.width() // 2
+            center_y = 42
+            self.draw_microphone(painter)
+            for offset in (0.0, 0.33, 0.66):
+                progress = (self.pulse_phase_value + offset) % 1.0
+                radius = 8 + (progress * 32)
+                alpha = max(20, int(140 * (1.0 - progress)))
+                pen = QPen(QColor(108, 99, 255, alpha), 2)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(
+                    int(center_x - radius),
+                    int(center_y - radius),
+                    int(radius * 2),
+                    int(radius * 2),
+                )
+
+        def draw_thinking(self, painter: QPainter) -> None:
+            """
+            Draw the rotating arc used while AI providers think.
+
+            Parameters:
+                painter (QPainter): Active widget painter.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            center_x = self.width() // 2
+            center_y = 42
+            painter.save()
+            painter.translate(center_x, center_y)
+            painter.rotate(self.spin_angle_value)
+            pen = QPen(self.accent_color, 4)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawArc(-20, -20, 40, 40, 20 * 16, 260 * 16)
+            painter.restore()
+
+        def draw_speaking(self, painter: QPainter, color: QColor) -> None:
+            """
+            Draw the animated equalizer bars for speaking and error states.
+
+            Parameters:
+                painter (QPainter): Active widget painter.
+                color (QColor): Accent color for the bars.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            base_x = (self.width() // 2) - 36
+            base_y = 54
+            painter.setPen(Qt.PenStyle.NoPen)
+            for index, value in enumerate(self.bar_values):
+                x_pos = base_x + (index * 18)
+                glow_color = QColor(color)
+                glow_color.setAlpha(70)
+                painter.setBrush(glow_color)
+                painter.drawRoundedRect(x_pos - 2, int(base_y - value - 2), 12, int(value + 4), 6, 6)
+                painter.setBrush(color)
+                painter.drawRoundedRect(x_pos, int(base_y - value), 8, int(value), 4, 4)
+
+        def draw_provider_badge(self, painter: QPainter) -> None:
+            """
+            Draw the provider pill in the thinking state.
+
+            Parameters:
+                painter (QPainter): Active widget painter.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            badge_rect = QRectF(self.width() - 84, 30, 56, 22)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 22))
+            painter.drawRoundedRect(badge_rect, 11, 11)
+            painter.setPen(self.text_color)
+            painter.setFont(QFont("Helvetica Neue", 9))
+            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, self.provider_name)
+
+        def draw_text(self, painter: QPainter) -> None:
+            """
+            Draw the current overlay caption with animated opacity.
+
+            Parameters:
+                painter (QPainter): Active widget painter.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            if not self.display_text:
+                return
+            painter.save()
+            color = QColor(self.text_color)
+            color.setAlphaF(max(0.0, min(1.0, self.text_opacity_value)))
+            painter.setPen(color)
+            painter.setFont(QFont("Helvetica Neue", 13))
+            painter.drawText(
+                QRectF(24, 68, self.width() - 48, 26),
+                Qt.AlignmentFlag.AlignCenter,
+                self.display_text,
+            )
+            painter.restore()
+
+        def paintEvent(self, event: Any) -> None:
+            """
+            Paint the overlay background and active-state graphics.
+
+            Parameters:
+                event (Any): Qt paint event.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method does not raise exceptions.
+            """
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            self.draw_background(painter)
+
+            if self.current_state == "idle":
+                self.draw_idle(painter)
+            elif self.current_state == "listening":
+                self.draw_listening(painter)
+            elif self.current_state == "thinking":
+                self.draw_thinking(painter)
+                self.draw_provider_badge(painter)
+            elif self.current_state == "speaking":
+                self.draw_speaking(painter, self.accent_color)
+            elif self.current_state == "error":
+                self.draw_speaking(painter, self.error_color)
+
+            self.draw_text(painter)
+
+        def get_pulse_phase(self) -> float:
+            return self.pulse_phase_value
+
+        def set_pulse_phase(self, value: float) -> None:
+            self.pulse_phase_value = float(value)
+            self.update()
+
+        pulsePhase = pyqtProperty(float, fget=get_pulse_phase, fset=set_pulse_phase)
+
+        def get_spin_angle(self) -> float:
+            return self.spin_angle_value
+
+        def set_spin_angle(self, value: float) -> None:
+            self.spin_angle_value = float(value)
+            self.update()
+
+        spinAngle = pyqtProperty(float, fget=get_spin_angle, fset=set_spin_angle)
+
+        def get_text_opacity(self) -> float:
+            return self.text_opacity_value
+
+        def set_text_opacity(self, value: float) -> None:
+            self.text_opacity_value = float(value)
+            self.update()
+
+        textOpacity = pyqtProperty(float, fget=get_text_opacity, fset=set_text_opacity)
+
+        def _get_bar_value(self, index: int) -> float:
+            return self.bar_values[index]
+
+        def _set_bar_value(self, index: int, value: float) -> None:
+            self.bar_values[index] = float(value)
+            self.update()
+
+        def get_bar_level_0(self) -> float:
+            return self._get_bar_value(0)
+
+        def set_bar_level_0(self, value: float) -> None:
+            self._set_bar_value(0, value)
+
+        barLevel0 = pyqtProperty(float, fget=get_bar_level_0, fset=set_bar_level_0)
+
+        def get_bar_level_1(self) -> float:
+            return self._get_bar_value(1)
+
+        def set_bar_level_1(self, value: float) -> None:
+            self._set_bar_value(1, value)
+
+        barLevel1 = pyqtProperty(float, fget=get_bar_level_1, fset=set_bar_level_1)
+
+        def get_bar_level_2(self) -> float:
+            return self._get_bar_value(2)
+
+        def set_bar_level_2(self, value: float) -> None:
+            self._set_bar_value(2, value)
+
+        barLevel2 = pyqtProperty(float, fget=get_bar_level_2, fset=set_bar_level_2)
+
+        def get_bar_level_3(self) -> float:
+            return self._get_bar_value(3)
+
+        def set_bar_level_3(self, value: float) -> None:
+            self._set_bar_value(3, value)
+
+        barLevel3 = pyqtProperty(float, fget=get_bar_level_3, fset=set_bar_level_3)
+
+        def get_bar_level_4(self) -> float:
+            return self._get_bar_value(4)
+
+        def set_bar_level_4(self, value: float) -> None:
+            self._set_bar_value(4, value)
+
+        barLevel4 = pyqtProperty(float, fget=get_bar_level_4, fset=set_bar_level_4)
+
+    class JarvisOverlayThread(threading.Thread):
+        """
+        Host the PyQt overlay in a dedicated thread.
+
+        Parameters:
+            bridge (UIBridge): Signal bridge used by the voice pipeline.
+            logger (logging.Logger): Logger for UI lifecycle events.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This thread reports failures to the logger and exits cleanly.
+        """
+
+        def __init__(self, bridge: UIBridge, logger: logging.Logger) -> None:
+            super().__init__(daemon=True, name="jarvis-overlay-ui")
+            self.bridge = bridge
+            self.logger = logger
+            self.ready_event = threading.Event()
+            self.failed = False
+
+        def run(self) -> None:
+            """
+            Start the Qt event loop and wire the bridge to the overlay.
+
+            Parameters:
+                None.
+
+            Returns:
+                None.
+
+            Exceptions:
+                This method catches and logs UI failures.
+            """
+            try:
+                app = QApplication.instance() or QApplication([])
+                app.setQuitOnLastWindowClosed(False)
+                overlay = JarvisOverlay()
+                self.bridge.state_signal.connect(overlay.on_state_changed)
+                self.bridge.text_signal.connect(overlay.on_text_changed)
+                self.bridge.provider_signal.connect(overlay.on_provider_changed)
+                self.bridge.stop_signal.connect(overlay.on_stop_requested)
+                self.bridge.stop_signal.connect(app.quit)
+                self.ready_event.set()
+                app.exec()
+            except Exception as error:
+                self.failed = True
+                self.logger.error("Overlay UI failed to start: %s", error)
+                self.ready_event.set()
+
+else:
+
+    class UIBridge:
+        def __init__(self) -> None:
+            self.state_signal = None
+            self.text_signal = None
+            self.provider_signal = None
+            self.stop_signal = None
+
+    class JarvisOverlayThread(threading.Thread):
+        def __init__(self, bridge: UIBridge, logger: logging.Logger) -> None:
+            super().__init__(daemon=True, name="jarvis-overlay-ui-disabled")
+            self.ready_event = threading.Event()
+            self.failed = True
+
+        def run(self) -> None:
+            self.ready_event.set()
+
+
+class JarvisPresentationController:
+    """
+    Drive the terminal animator and optional PyQt overlay from one shared state machine.
+
+    Parameters:
+        ui_mode (str): Requested UI mode such as `both`, `terminal`, or `overlay`.
+        logger (logging.Logger): Logger for UI diagnostics and fallback events.
+
+    Returns:
+        None.
+
+    Exceptions:
+        Public methods catch their own UI errors so presentation never crashes JARVIS.
+    """
+
+    def __init__(self, ui_mode: str, logger: logging.Logger) -> None:
+        """
+        Initialize the presentation controller and requested backends.
+
+        Parameters:
+            ui_mode (str): Requested UI mode from configuration.
+            logger (logging.Logger): Logger for UI diagnostics.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This constructor does not raise exceptions.
+        """
+        # ── NEW ── keep terminal output and overlay state aligned from one controller ──
+        self.ui_mode = ui_mode
+        self.logger = logger
+        self.terminal_enabled = ui_mode in {"both", "terminal"}
+        self.overlay_requested = ui_mode in {"both", "overlay"}
+        self.terminal_animator = JarvisAnimator() if self.terminal_enabled else None
+        self.bridge = UIBridge() if self.overlay_requested else None
+        self.overlay_thread = JarvisOverlayThread(self.bridge, logger) if self.overlay_requested else None
+        self.output_lock = threading.Lock()
+        self.state = "idle"
+        self.provider = "gemini"
+        self.last_text = ""
+        self.overlay_enabled = False
+
+    def start(self) -> None:
+        """
+        Start the requested presentation backends.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method catches backend startup issues and logs fallbacks.
+        """
+        if self.terminal_animator is not None:
+            self.terminal_animator.start()
+
+        if self.overlay_thread is not None:
+            if QApplication is None:
+                self.logger.warning("PyQt6 is unavailable. Falling back to terminal-only mode.")
+                return
+            self.overlay_thread.start()
+            self.overlay_thread.ready_event.wait(timeout=3.0)
+            if self.overlay_thread.failed:
+                self.logger.warning("Overlay UI is unavailable. Falling back to terminal-only mode.")
+                return
+            self.overlay_enabled = True
+            self.set_provider(self.provider)
+            self.set_state(self.state, self.last_text)
+
+    def stop(self) -> None:
+        """
+        Stop the overlay and terminal animation cleanly.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method catches shutdown issues so application cleanup continues.
+        """
+        try:
+            if self.overlay_enabled and self.bridge is not None and getattr(self.bridge, "stop_signal", None):
+                self.bridge.stop_signal.emit()
+                if self.overlay_thread and self.overlay_thread.is_alive():
+                    self.overlay_thread.join(timeout=1.5)
+        except Exception as error:
+            self.logger.error("Overlay shutdown failed: %s", error)
+
+        if self.terminal_animator is not None:
+            self.terminal_animator.stop()
+
+    def safe_print(self, message: str) -> None:
+        """
+        Print text safely above the terminal animation when enabled.
+
+        Parameters:
+            message (str): Message to print.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method catches terminal output issues.
+        """
+        if self.terminal_animator is not None:
+            self.terminal_animator.safe_print(message)
+            return
+
+        with self.output_lock:
+            try:
+                print(message)
+            except Exception:
+                pass
+
+    def clear_line(self) -> None:
+        """
+        Clear the terminal animation line when enabled.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        if self.terminal_animator is not None:
+            self.terminal_animator.clear_line()
+
+    def set_provider(self, provider: str) -> None:
+        """
+        Update the provider label across all active UIs.
+
+        Parameters:
+            provider (str): Provider name such as `gemini` or `groq`.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        self.provider = provider.strip().lower() or "gemini"
+        if self.terminal_animator is not None:
+            self.terminal_animator.set_provider(self.provider)
+        if self.overlay_enabled and self.bridge is not None and getattr(self.bridge, "provider_signal", None):
+            self.bridge.provider_signal.emit(self.provider)
+
+    def set_text(self, text: str) -> None:
+        """
+        Update the overlay text without changing the active state.
+
+        Parameters:
+            text (str): Text to display.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        self.last_text = text.strip()
+        if self.overlay_enabled and self.bridge is not None and getattr(self.bridge, "text_signal", None):
+            self.bridge.text_signal.emit(self.last_text)
+
+    def set_state(self, state: str, text: str = "") -> None:
+        """
+        Update the shared state machine and fan it out to every UI backend.
+
+        Parameters:
+            state (str): Shared state such as `idle`, `listening`, `thinking`, `speaking`, or `error`.
+            text (str): Optional state-associated text.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        self.state = state
+        if text:
+            self.last_text = text.strip()
+
+        if self.terminal_animator is not None:
+            self.terminal_animator.set_state(state)
+
+        if self.overlay_enabled and self.bridge is not None:
+            if getattr(self.bridge, "state_signal", None):
+                self.bridge.state_signal.emit(state)
+            if getattr(self.bridge, "text_signal", None):
+                overlay_text = self.last_text
+                if state == "listening" and not overlay_text:
+                    overlay_text = "Listening..."
+                elif state == "thinking" and not overlay_text:
+                    overlay_text = "Thinking..."
+                self.bridge.text_signal.emit(overlay_text)
+
 # ══════════════════════════════════════════════════════════
 # ██  TEXT-TO-SPEECH ENGINE
 # ══════════════════════════════════════════════════════════
@@ -1226,7 +2259,7 @@ class TextToSpeechEngine:
         Methods catch and log TTS errors instead of raising them.
     """
 
-    def __init__(self, voice_rate: int, animator: JarvisAnimator, logger: logging.Logger) -> None:
+    def __init__(self, voice_rate: int, animator: JarvisPresentationController, logger: logging.Logger) -> None:
         """
         Initialize the TTS queue, state flags, and pyttsx3 engine reference.
 
@@ -1397,7 +2430,8 @@ class TextToSpeechEngine:
 
         # ── mark the speaking state so listeners can pause microphone capture ──
         self.speaking_event.set()
-        self.animator.set_state("speaking")
+        self.animator.set_state("speaking", text)
+        self.animator.set_text(text)
 
         try:
             # ── speak one sentence chunk at a time so pacing sounds more natural ──
@@ -1478,7 +2512,7 @@ class SpeechRecognizerManager:
 
     def __init__(
         self,
-        animator: JarvisAnimator,
+        animator: JarvisPresentationController,
         tts_engine: TextToSpeechEngine,
         logger: logging.Logger,
     ) -> None:
@@ -1568,7 +2602,7 @@ class SpeechRecognizerManager:
 
         # ── switch the animation to listening while the mic is hot ──
         if mode == "command":
-            self.animator.set_state("listening")
+            self.animator.set_state("listening", "Listening...")
 
         try:
             # ── serialize microphone access so wake and command listeners never collide ──
@@ -1907,7 +2941,7 @@ class AIRouter:
         config: AppConfig,
         logger: logging.Logger,
         db_manager: DatabaseManager,
-        animator: JarvisAnimator,
+        animator: JarvisPresentationController,
     ) -> None:
         """
         Initialize both provider managers and routing state.
@@ -2100,7 +3134,7 @@ class AIRouter:
 
             # ── show the current provider in the thinking animation before the API call ──
             self.animator.set_provider(provider_name)
-            self.animator.set_state("thinking")
+            self.animator.set_state("thinking", "Thinking...")
 
             # ── record timing so the database can track provider performance ──
             start_time = time.perf_counter()
@@ -2206,6 +3240,160 @@ def format_duration(seconds: int) -> str:
     return f"{seconds} second{'s' if seconds != 1 else ''}"
 
 
+# ─═════════════════════════════════════════════════════════
+# ██  LOCAL SKILL HELPERS
+# ══════════════════════════════════════════════════════════
+
+
+def clean_spoken_entity(entity: str) -> str:
+    """
+    Strip filler words from a spoken file, folder, or destination phrase.
+
+    Parameters:
+        entity (str): Raw spoken entity text.
+
+    Returns:
+        str: Cleaned entity text.
+
+    Exceptions:
+        This function does not raise exceptions.
+    """
+    cleaned = entity.strip().strip(" .!?")
+    cleaned = re.sub(
+        r"^(please\s+|the\s+|my\s+|this\s+|that\s+|a\s+|an\s+)+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^(file|folder|directory|folder called|folder named|file called|file named)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"^(called|named)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip().strip("\"'")
+
+
+def format_bytes(size_in_bytes: int) -> str:
+    """
+    Convert a byte count into a compact human-readable string.
+
+    Parameters:
+        size_in_bytes (int): Raw size in bytes.
+
+    Returns:
+        str: Human-readable size such as `2.3 GB`.
+
+    Exceptions:
+        This function does not raise exceptions.
+    """
+    value = float(size_in_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+def parse_spoken_number(text: str) -> Optional[int]:
+    """
+    Convert simple spoken ordinal choices into an integer index.
+
+    Parameters:
+        text (str): Spoken number text.
+
+    Returns:
+        Optional[int]: Parsed 1-based number, or None when unclear.
+
+    Exceptions:
+        This function does not raise exceptions.
+    """
+    cleaned_text = text.strip().lower()
+    if cleaned_text.isdigit():
+        return int(cleaned_text)
+
+    mapping = {
+        "one": 1,
+        "first": 1,
+        "two": 2,
+        "second": 2,
+        "three": 3,
+        "third": 3,
+        "four": 4,
+        "fourth": 4,
+        "five": 5,
+        "fifth": 5,
+    }
+    return mapping.get(cleaned_text)
+
+
+def safe_calculate(expression: str) -> float:
+    """
+    Evaluate a restricted arithmetic expression safely.
+
+    Parameters:
+        expression (str): Expression using numbers and basic operators.
+
+    Returns:
+        float: Calculated numeric result.
+
+    Exceptions:
+        Raises:
+            ValueError: When the expression contains unsupported syntax.
+    """
+    allowed_binary_ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+    }
+    allowed_unary_ops = {
+        ast.UAdd: operator.pos,
+        ast.USub: operator.neg,
+    }
+
+    def evaluate(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.Num):
+            return float(node.n)
+        if isinstance(node, ast.BinOp) and type(node.op) in allowed_binary_ops:
+            return allowed_binary_ops[type(node.op)](evaluate(node.left), evaluate(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in allowed_unary_ops:
+            return allowed_unary_ops[type(node.op)](evaluate(node.operand))
+        raise ValueError("Unsupported expression")
+
+    if not re.fullmatch(r"[\d\s\.\+\-\*\/%\(\)]+", expression):
+        raise ValueError("Unsupported expression")
+
+    parsed = ast.parse(expression, mode="eval")
+    return evaluate(parsed)
+
+
+def format_result_number(value: float) -> str:
+    """
+    Format a float so whole numbers are spoken cleanly.
+
+    Parameters:
+        value (float): Numeric value to format.
+
+    Returns:
+        str: Spoken-friendly numeric string.
+
+    Exceptions:
+        This function does not raise exceptions.
+    """
+    if math.isclose(value, round(value), abs_tol=1e-9):
+        return str(int(round(value)))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
 # ══════════════════════════════════════════════════════════
 # ██  COMMAND ROUTER
 # ══════════════════════════════════════════════════════════
@@ -2248,7 +3436,8 @@ class JarvisApp:
         self.command_active = threading.Event()
         self.shutdown_lock = threading.Lock()
 
-        self.animator = JarvisAnimator()
+        # ── UPGRADED ── keep the terminal animation and optional overlay behind one controller ──
+        self.animator = JarvisPresentationController(config.ui_mode, self.logger)
         self.tts_engine = TextToSpeechEngine(config.voice_rate, self.animator, self.logger)
         self.speech_manager = SpeechRecognizerManager(self.animator, self.tts_engine, self.logger)
         self.db_manager = DatabaseManager(config, self.logger)
@@ -2261,6 +3450,591 @@ class JarvisApp:
 
         self.microphone_ready = False
         self.provider_status = {"gemini": False, "groq": False}
+        self.last_response_text = ""
+        self.automation_available = pyautogui is not None
+        self.home_path = Path.home()
+        self.desktop_path = self.home_path / "Desktop"
+        self.documents_path = self.home_path / "Documents"
+        self.downloads_path = self.home_path / "Downloads"
+        self.common_search_roots = [
+            self.desktop_path,
+            self.documents_path,
+            self.downloads_path,
+            self.home_path,
+        ]
+        self.skill_routes: List[Tuple[List[str], Any]] = [
+            (["goodbye", "shut down", "exit", "that's all"], self.handle_exit_commands),
+            (
+                [
+                    "what time",
+                    "current time",
+                    "what's the time",
+                    "what's the date",
+                    "today's date",
+                    "what day is it",
+                    "take a screenshot",
+                    "screenshot",
+                    "volume",
+                    "mute",
+                    "unmute",
+                    "brightness",
+                    "lock screen",
+                    "sleep computer",
+                    "what's my ip",
+                    "ip address",
+                    "battery",
+                    "storage",
+                    "ram",
+                    "cpu",
+                    "processes",
+                    "system status",
+                    "jarvis status",
+                    "empty trash",
+                ],
+                self.handle_system_control_commands,
+            ),
+            (
+                [
+                    "rename ",
+                    "change the name",
+                    "move ",
+                    "put ",
+                    "send ",
+                    "delete ",
+                    "remove ",
+                    "trash ",
+                    "copy ",
+                    "duplicate ",
+                    "make a copy",
+                    "create a folder",
+                    "make a new folder",
+                    "new folder",
+                    "find ",
+                    "where is ",
+                    "locate ",
+                    "search for file",
+                    "what's in ",
+                    "list contents",
+                    "show me what's in",
+                    "in finder",
+                    "open ",
+                    "launch ",
+                    "open the file",
+                    "tell me about",
+                    "file info",
+                    "what is ",
+                    "organize my desktop",
+                    "clean up desktop",
+                    "sort my desktop",
+                ],
+                self.handle_file_management_commands,
+            ),
+            (
+                ["clipboard", "copy that", "clear clipboard", "read clipboard"],
+                self.handle_clipboard_commands,
+            ),
+            (
+                [
+                    "type ",
+                    "write ",
+                    "press enter",
+                    "press escape",
+                    "select all",
+                    "copy",
+                    "paste",
+                    "undo",
+                ],
+                self.handle_text_input_commands,
+            ),
+            (
+                [
+                    "minimize window",
+                    "close window",
+                    "switch app",
+                    "next app",
+                    "show desktop",
+                    "full screen",
+                ],
+                self.handle_window_management_commands,
+            ),
+            (
+                ["are we connected", "check internet", "wifi", "network settings"],
+                self.handle_network_commands,
+            ),
+            (
+                ["calculate ", "convert ", "percent of", " in binary", "what is "],
+                self.handle_calculation_commands,
+            ),
+            (
+                ["make a note", "note this down", "read my notes", "what are my notes", "clear my notes"],
+                self.handle_notes_commands,
+            ),
+            (
+                ["weather", "will it rain"],
+                self.handle_weather_commands,
+            ),
+            (
+                ["remember that", "do you remember", "what do you know about", "what do you remember", "list your memories"],
+                self.handle_memory_commands,
+            ),
+            (
+                ["set a timer", "remind me to"],
+                self.handle_timer_and_reminder_commands,
+            ),
+            (
+                ["open browser", "open chrome", "open safari", "launch browser", "search for ", "google ", "open ", "launch "],
+                self.handle_app_launch_commands,
+            ),
+            (
+                ["tell me a joke", "flip a coin", "roll a dice", "motivate me", "what version are you", " in binary"],
+                self.handle_fun_commands,
+            ),
+        ]
+        self.jokes = [
+            "Why do programmers prefer dark mode? Because light attracts bugs.",
+            "Why did the computer go to therapy? It had too many unresolved issues.",
+            "I would tell you a UDP joke, sir, but you might not get it.",
+            "Why was the Mac so calm? It had excellent Finder control.",
+            "Parallel lines have so much in common. It is a shame they will never meet.",
+            "Why do Java developers wear glasses? Because they do not C sharp.",
+            "Why was the keyboard so honest? It always had the right keys.",
+            "Why did the scarecrow become a developer? He was outstanding in his field.",
+            "What do you call eight hobbits? A hobbyte.",
+            "Why did the server break up with the client? Too many bad requests.",
+            "Why was the battery optimistic? It still had some charge left.",
+            "How do trees get online? They log in.",
+            "Why did the notebook blush? It saw the desktop get organized.",
+            "What did the RAM say after a workout? I feel refreshed.",
+            "Why do calendars seem so confident? Their days are numbered.",
+            "Why did the phone wear glasses? It lost its contacts.",
+            "Why did the folder look proud? It had everything in order.",
+            "What is a computer's favorite snack? Microchips.",
+            "Why was the browser exhausted? Too many tabs open.",
+            "Why did the developer stay calm? They had excellent exception handling.",
+        ]
+        self.motivational_quotes = [
+            "Small steps still move the mission forward.",
+            "Momentum beats perfection, sir.",
+            "You do not need a perfect day to make meaningful progress.",
+            "Consistency turns difficult work into normal work.",
+            "The next attempt might be the one that clicks.",
+            "You have handled hard things before. This is another one.",
+            "Progress hides inside repetition.",
+            "A calm mind makes sharper decisions.",
+            "Finish the next clear step, then the next one after that.",
+            "Discipline is just confidence built in public.",
+        ]
+
+    def queue_response(self, text: str, provider: Optional[str] = None) -> None:
+        """
+        Persist and speak one assistant response.
+
+        Parameters:
+            text (str): Assistant text to log and speak.
+            provider (Optional[str]): AI provider name when the response came from AI.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        self.last_response_text = text
+        self.db_manager.log_conversation(self.session_id, "assistant", text, provider)
+        self.tts_engine.speak(text)
+
+    def speak_and_wait(self, text: str) -> None:
+        """
+        Speak text and block until the queued speech finishes.
+
+        Parameters:
+            text (str): Text to speak.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        self.last_response_text = text
+        done_event = self.tts_engine.speak(text)
+        done_event.wait()
+
+    def listen_for_followup(self, timeout: int = 6, phrase_time_limit: int = 6) -> Optional[str]:
+        """
+        Listen for a short follow-up answer during confirmations or disambiguation.
+
+        Parameters:
+            timeout (int): Seconds to wait for speech to start.
+            phrase_time_limit (int): Maximum phrase duration in seconds.
+
+        Returns:
+            Optional[str]: Recognized text, or None when nothing clear was heard.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        return self.speech_manager.listen_for_text(
+            timeout=timeout,
+            phrase_time_limit=phrase_time_limit,
+            mode="command",
+            prompt_on_failure=False,
+        )
+
+    def ask_confirmation(self, prompt: str) -> bool:
+        """
+        Ask for a yes or no confirmation and default to cancel on ambiguity.
+
+        Parameters:
+            prompt (str): Prompt to speak before listening.
+
+        Returns:
+            bool: True only when the user confirms clearly.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        self.speak_and_wait(prompt)
+        confirmation = self.listen_for_followup()
+        if not confirmation:
+            return False
+        lowered_confirmation = confirmation.strip().lower()
+        if any(word in lowered_confirmation for word in ["yes", "confirm", "do it", "go ahead"]):
+            return True
+        return False
+
+    def run_subprocess(self, command: List[str]) -> bool:
+        """
+        Run a subprocess command and log failures centrally.
+
+        Parameters:
+            command (List[str]): Command tokens to execute.
+
+        Returns:
+            bool: True when the command exits successfully.
+
+        Exceptions:
+            This method catches subprocess failures and returns False.
+        """
+        try:
+            subprocess.run(command, check=True)
+            return True
+        except Exception as error:
+            self.logger.error("Command failed (%s): %s", " ".join(command), error)
+            return False
+
+    def run_applescript(self, script: str) -> bool:
+        """
+        Execute a small AppleScript command safely.
+
+        Parameters:
+            script (str): AppleScript source.
+
+        Returns:
+            bool: True when the script succeeds.
+
+        Exceptions:
+            This method catches subprocess failures and returns False.
+        """
+        return self.run_subprocess(["osascript", "-e", script])
+
+    def check_automation_permissions(self) -> bool:
+        """
+        Check whether pyautogui automation appears available on this Mac.
+
+        Parameters:
+            None.
+
+        Returns:
+            bool: True when keyboard automation should work, otherwise False.
+
+        Exceptions:
+            This method catches automation-check failures and disables the feature gracefully.
+        """
+        if pyautogui is None:
+            self.automation_available = False
+            return False
+
+        try:
+            pyautogui.position()
+            pyautogui.size()
+            self.automation_available = True
+        except Exception as error:
+            self.automation_available = False
+            self.logger.warning("Accessibility automation is unavailable: %s", error)
+        return self.automation_available
+
+    def ensure_automation_available(self) -> Tuple[bool, str]:
+        """
+        Verify keyboard automation can be used before running pyautogui actions.
+
+        Parameters:
+            None.
+
+        Returns:
+            Tuple[bool, str]: Availability flag and the appropriate spoken response on failure.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        if pyautogui is None:
+            return False, "pyautogui is not installed, so automation skills are unavailable, sir."
+        if self.automation_available:
+            return True, ""
+        return False, (
+            "I need accessibility permissions sir. Please enable them in System Preferences."
+        )
+
+    def perform_automation_action(self, action: Any, success_message: str) -> Tuple[bool, str, bool]:
+        """
+        Run a pyautogui action with graceful accessibility failure handling.
+
+        Parameters:
+            action (Any): Callable that performs the automation step.
+            success_message (str): Spoken success response.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard local-skill result tuple.
+
+        Exceptions:
+            This method catches automation failures and disables automation gracefully.
+        """
+        available, failure_message = self.ensure_automation_available()
+        if not available:
+            return True, failure_message, False
+
+        try:
+            action()
+            return True, success_message, False
+        except Exception as error:
+            self.logger.warning("Automation command failed: %s", error)
+            self.automation_available = False
+            return True, (
+                "I need accessibility permissions sir. Please enable them in System Preferences."
+            ), False
+
+    def resolve_special_folder(self, location_text: str) -> Optional[Path]:
+        """
+        Resolve spoken folder aliases like Desktop or Downloads.
+
+        Parameters:
+            location_text (str): Spoken destination text.
+
+        Returns:
+            Optional[Path]: Resolved folder path, or None when no alias matches.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        cleaned_location = clean_spoken_entity(location_text).lower()
+        aliases = {
+            "desktop": self.desktop_path,
+            "documents": self.documents_path,
+            "document": self.documents_path,
+            "downloads": self.downloads_path,
+            "download": self.downloads_path,
+            "home": self.home_path,
+            "house": self.home_path,
+        }
+        return aliases.get(cleaned_location)
+
+    def iter_search_matches(
+        self,
+        query: str,
+        include_files: bool = True,
+        include_dirs: bool = True,
+        roots: Optional[List[Path]] = None,
+        max_depth: int = 3,
+    ) -> List[Path]:
+        """
+        Search common roots recursively with a controlled depth limit.
+
+        Parameters:
+            query (str): Filename or folder phrase to look for.
+            include_files (bool): Whether files should be matched.
+            include_dirs (bool): Whether directories should be matched.
+            roots (Optional[List[Path]]): Custom search roots.
+            max_depth (int): Maximum recursive depth beneath each root.
+
+        Returns:
+            List[Path]: Ranked filesystem matches.
+
+        Exceptions:
+            This method catches filesystem access errors and continues searching.
+        """
+        search_query = clean_spoken_entity(query).lower()
+        if not search_query:
+            return []
+
+        search_roots = roots or self.common_search_roots
+        seen_paths: set[str] = set()
+        candidates: List[Tuple[int, Path]] = []
+
+        for root in search_roots:
+            if not root.exists():
+                continue
+
+            for current_root, dirs, files in os.walk(root):
+                current_path = Path(current_root)
+                try:
+                    relative_depth = len(current_path.relative_to(root).parts)
+                except Exception:
+                    relative_depth = 0
+
+                if relative_depth >= max_depth:
+                    dirs[:] = []
+
+                names: List[str] = []
+                if include_dirs:
+                    names.extend(dirs)
+                if include_files:
+                    names.extend(files)
+
+                for name in names:
+                    candidate_path = current_path / name
+                    normalized_name = name.lower()
+                    stem_name = candidate_path.stem.lower()
+                    if search_query not in normalized_name and search_query not in stem_name:
+                        continue
+                    resolved_string = str(candidate_path.resolve())
+                    if resolved_string in seen_paths:
+                        continue
+                    seen_paths.add(resolved_string)
+                    score = 0
+                    if normalized_name == search_query or stem_name == search_query:
+                        score -= 30
+                    elif normalized_name.startswith(search_query):
+                        score -= 20
+                    else:
+                        score -= 10
+                    score += relative_depth
+                    candidates.append((score, candidate_path))
+
+        return [candidate for _, candidate in sorted(candidates, key=lambda item: (item[0], str(item[1]).lower()))]
+
+    def choose_match(self, matches: List[Path], spoken_name: str) -> Optional[Path]:
+        """
+        Resolve multiple filesystem matches by asking the user which one they mean.
+
+        Parameters:
+            matches (List[Path]): Candidate paths.
+            spoken_name (str): Original spoken target name.
+
+        Returns:
+            Optional[Path]: Chosen path, or None when the choice is unclear.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+
+        numbered_items = []
+        for index, path in enumerate(matches[:5], start=1):
+            parent_name = path.parent.name or "home"
+            numbered_items.append(f"{index}, {path.name} in {parent_name}")
+        prompt = (
+            f"I found multiple matches for {clean_spoken_entity(spoken_name)}. "
+            + " ".join(numbered_items)
+            + ". Say the number you want."
+        )
+        self.speak_and_wait(prompt)
+        answer = self.listen_for_followup()
+        if not answer:
+            return None
+
+        number = parse_spoken_number(answer)
+        if number is not None and 1 <= number <= min(len(matches), 5):
+            return matches[number - 1]
+
+        lowered_answer = answer.lower()
+        for path in matches[:5]:
+            if path.name.lower() in lowered_answer:
+                return path
+        return None
+
+    def resolve_existing_target(
+        self,
+        target_text: str,
+        include_files: bool = True,
+        include_dirs: bool = True,
+    ) -> Optional[Path]:
+        """
+        Find an existing filesystem target using common locations and voice disambiguation.
+
+        Parameters:
+            target_text (str): Spoken target phrase.
+            include_files (bool): Whether file matches are allowed.
+            include_dirs (bool): Whether folder matches are allowed.
+
+        Returns:
+            Optional[Path]: Resolved path, or None when not found or not clarified.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        direct_alias = self.resolve_special_folder(target_text)
+        if direct_alias is not None and direct_alias.exists():
+            return direct_alias
+
+        matches = self.iter_search_matches(
+            target_text,
+            include_files=include_files,
+            include_dirs=include_dirs,
+            roots=self.common_search_roots,
+            max_depth=3,
+        )
+        return self.choose_match(matches, target_text)
+
+    def resolve_destination_path(self, destination_text: str) -> Optional[Path]:
+        """
+        Resolve a spoken destination to a usable folder path.
+
+        Parameters:
+            destination_text (str): Spoken destination phrase.
+
+        Returns:
+            Optional[Path]: Resolved folder path, or None when resolution fails.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        special_folder = self.resolve_special_folder(destination_text)
+        if special_folder is not None:
+            return special_folder
+
+        direct_path = Path(destination_text).expanduser()
+        if direct_path.exists() and direct_path.is_dir():
+            return direct_path
+
+        return self.resolve_existing_target(destination_text, include_files=False, include_dirs=True)
+
+    def trash_path(self, target_path: Path) -> bool:
+        """
+        Move a path to Trash without permanently deleting it.
+
+        Parameters:
+            target_path (Path): File or folder to trash.
+
+        Returns:
+            bool: True when the item reaches Trash successfully.
+
+        Exceptions:
+            This method catches Trash failures and returns False.
+        """
+        try:
+            if send2trash is not None:
+                send2trash(str(target_path))
+                return True
+        except Exception as error:
+            self.logger.error("send2trash failed for %s: %s", target_path, error)
+
+        applescript = (
+            f'tell application "Finder" to delete POSIX file "{str(target_path).replace(chr(34), chr(92) + chr(34))}"'
+        )
+        return self.run_applescript(applescript)
 
     def current_uptime(self) -> str:
         """
@@ -2339,8 +4113,11 @@ class JarvisApp:
         # ── initialize text-to-speech; failure is non-fatal because terminal output still works ──
         self.tts_engine.initialize_engine()
 
-        # ── start the animation thread before printing the status panel ──
+        # ── UPGRADED ── start the shared presentation controller before printing status ──
         self.animator.start()
+
+        # ── check keyboard automation support once at startup and disable it cleanly on failure ──
+        self.check_automation_permissions()
 
         # ── start the background reminder checker thread ──
         self.start_reminder_checker_thread()
@@ -2356,6 +4133,11 @@ class JarvisApp:
         self.tts_engine.speak_sync(
             "JARVIS online. Gemini and Groq systems active. All systems operational. How can I assist you sir?"
         )
+
+        if pyautogui is not None and not self.automation_available:
+            self.tts_engine.speak_sync(
+                "I need accessibility permissions sir. Please enable them in System Preferences."
+            )
 
         # ── begin the always-on wake-word loop in the background ──
         self.start_wake_listener_thread()
@@ -2379,6 +4161,7 @@ class JarvisApp:
         groq_mark = "✓" if self.provider_status.get("groq") else "✗"
         db_mark = "✓"
         mic_mark = "✓" if self.microphone_ready else "✗"
+        ui_mode = self.config.ui_mode.title()
 
         # ── build the requested terminal status panel ──
         panel = (
@@ -2389,6 +4172,7 @@ class JarvisApp:
             f"│  Fallback AI  : Groq LLaMA3        {groq_mark}   │\n"
             f"│  Database     : PostgreSQL         {db_mark}   │\n"
             f"│  Microphone   : Ready              {mic_mark}   │\n"
+            f"│  UI Mode      : {ui_mode}{' ' * max(0, 19 - len(ui_mode))}│\n"
             f"│  Wake Word    : \"{self.config.wake_word}\"{' ' * max(0, 14 - len(self.config.wake_word))}│\n"
             f"│  Session ID   : {self.session_id}{' ' * max(0, 23 - len(self.session_id))}│\n"
             "└─────────────────────────────────────────┘"
@@ -2552,7 +4336,7 @@ class JarvisApp:
             f"Uptime is {uptime}."
         )
 
-    def handle_builtin_skill(self, command: str) -> Tuple[bool, str, bool]:
+    def handle_builtin_skill_legacy(self, command: str) -> Tuple[bool, str, bool]:
         """
         Handle local skills before any AI call is made.
 
@@ -2570,18 +4354,18 @@ class JarvisApp:
         lowered_command = cleaned_command.lower()
 
         # ── handle explicit shutdown phrases first ──
-        if lowered_command in {"goodbye", "shut down", "exit", "that's all"}:
+        if lowered_command in {"goodbye", "shut down", "exit", "that's all","bye bye"}:
             return True, "Shutting down all systems. Goodbye sir.", True
 
         # ── answer local time requests instantly ──
-        if any(pattern in lowered_command for pattern in ["what time", "current time", "what's the time"]):
+        if any(pattern in lowered_command for pattern in ["what time", "current time", "what's the time","time"]):
             current_time = datetime.datetime.now().strftime("%I:%M %p")
             return True, f"The time is {current_time}, sir.", False
 
         # ── answer local date requests instantly ──
         if any(
             pattern in lowered_command
-            for pattern in ["what's the date", "today's date", "what day is it"]
+            for pattern in ["what's the date", "today's date", "what day is it","date","day"]
         ):
             current_date = datetime.datetime.now().strftime("%A, %B %d, %Y")
             return True, f"Today is {current_date}, sir.", False
@@ -2589,7 +4373,7 @@ class JarvisApp:
         # ── open a browser when browser phrases are spoken ──
         if any(
             pattern in lowered_command
-            for pattern in ["open browser", "open chrome", "open safari", "launch browser"]
+            for pattern in ["open browser", "open chrome", "launch browser", "chrome", "browser"]
         ):
             try:
                 webbrowser.open("https://www.google.com")
@@ -2597,6 +4381,18 @@ class JarvisApp:
             except Exception as error:
                 self.logger.error("Browser launch failed: %s", error)
                 return True, "I could not open the browser, sir.", False
+
+        # ── open a safari when safari phrases are spoken ──
+        if any(
+            pattern in lowered_command
+            for pattern in ["open safari", "launch safari","safari"]
+        ):
+            try:
+                webbrowser.open("https://www.safari.com")
+                return True, "Opening your safari, sir.", False
+            except Exception as error:
+                self.logger.error("Safari launch failed: %s", error)
+                return True, "I could not open the safari, sir.", False
 
         # ── open an arbitrary macOS application by name ──
         app_match = re.match(r"^(open|launch)\s+(.+)$", lowered_command)
@@ -2700,9 +4496,883 @@ class JarvisApp:
         # ── hand off anything unmatched to the AI router ──
         return False, "", False
 
+    def handle_exit_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle explicit shutdown phrases.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        if lowered_command in {"goodbye", "shut down", "exit", "that's all", "bye bye"}:
+            return True, "Shutting down all systems. Goodbye sir.", True
+        return False, "", False
+
+    def handle_system_control_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle system control, diagnostics, and screenshot commands.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches local command failures and returns friendly responses.
+        """
+        if any(pattern in lowered_command for pattern in ["what time", "current time", "what's the time"]):
+            return True, f"The time is {datetime.datetime.now().strftime('%I:%M %p')}, sir.", False
+
+        if any(pattern in lowered_command for pattern in ["what's the date", "today's date", "what day is it"]):
+            return True, f"Today is {datetime.datetime.now().strftime('%A, %B %d, %Y')}, sir.", False
+
+        if lowered_command in {"system status", "jarvis status"}:
+            return True, self.build_status_report(), False
+
+        if lowered_command in {"take a screenshot", "screenshot"} or "take a screenshot" in lowered_command:
+            _, response_text = self.take_screenshot()
+            return True, response_text, False
+
+        if lowered_command in {"increase volume", "volume up"}:
+            success = self.run_applescript(
+                "set volume output volume ((output volume of (get volume settings)) + 10)"
+            )
+            return True, "Volume increased, sir." if success else "I could not adjust the volume, sir.", False
+
+        if lowered_command in {"decrease volume", "volume down"}:
+            success = self.run_applescript(
+                "set volume output volume ((output volume of (get volume settings)) - 10)"
+            )
+            return True, "Volume decreased, sir." if success else "I could not adjust the volume, sir.", False
+
+        volume_match = re.search(r"set volume to\s+(\d{1,3})", lowered_command)
+        if volume_match:
+            volume = max(0, min(100, int(volume_match.group(1))))
+            success = self.run_applescript(f"set volume output volume {volume}")
+            return True, (
+                f"Volume set to {volume} percent, sir." if success else "I could not set the volume, sir."
+            ), False
+
+        if lowered_command in {"mute", "mute volume"}:
+            success = self.run_applescript("set volume output muted true")
+            return True, "Volume muted, sir." if success else "I could not mute the volume, sir.", False
+
+        if lowered_command == "unmute":
+            success = self.run_applescript("set volume output muted false")
+            return True, "Volume restored, sir." if success else "I could not unmute the volume, sir.", False
+
+        if lowered_command in {"increase brightness", "brightness up", "decrease brightness", "brightness down"}:
+            brightness_cli = shutil.which("brightness")
+            if not brightness_cli:
+                return True, "The brightness command line tool is not installed, sir.", False
+            try:
+                current = subprocess.run(
+                    [brightness_cli, "-l"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                match = re.search(r"brightness\s+([0-9.]+)", current.stdout)
+                current_value = float(match.group(1)) if match else 0.5
+                delta = 0.1 if "increase" in lowered_command or "up" in lowered_command else -0.1
+                target = min(1.0, max(0.0, current_value + delta))
+                subprocess.run([brightness_cli, str(target)], check=True)
+                response = "Brightness increased, sir." if delta > 0 else "Brightness decreased, sir."
+                return True, response, False
+            except Exception as error:
+                self.logger.error("Brightness command failed: %s", error)
+                return True, "I could not adjust the brightness, sir.", False
+
+        if lowered_command == "lock screen":
+            success = self.run_subprocess(["pmset", "displaysleepnow"])
+            return True, "Locking the screen, sir." if success else "I could not lock the screen, sir.", False
+
+        if lowered_command in {"sleep", "sleep computer"}:
+            success = self.run_applescript('tell app "System Events" to sleep')
+            return True, "Putting the computer to sleep, sir." if success else "I could not put the computer to sleep, sir.", False
+
+        if lowered_command == "empty trash":
+            if not self.ask_confirmation("Are you sure you want to empty the Trash? Say yes to confirm."):
+                return True, "Trash emptying cancelled sir.", False
+            success = self.run_applescript('tell app "Finder" to empty trash')
+            return True, "Trash emptied, sir." if success else "I could not empty the Trash, sir.", False
+
+        if "ip address" in lowered_command:
+            try:
+                ip_address = socket.gethostbyname(socket.gethostname())
+                if ip_address.startswith("127."):
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                        sock.connect(("8.8.8.8", 80))
+                        ip_address = sock.getsockname()[0]
+                return True, f"Your IP address is {ip_address}, sir.", False
+            except Exception as error:
+                self.logger.error("IP address lookup failed: %s", error)
+                return True, "I could not determine your IP address, sir.", False
+
+        if "battery" in lowered_command:
+            try:
+                result = subprocess.run(
+                    ["pmset", "-g", "batt"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                match = re.search(r"(\d+)%", result.stdout)
+                if match:
+                    return True, f"Battery is at {match.group(1)} percent, sir.", False
+            except Exception as error:
+                self.logger.error("Battery lookup failed: %s", error)
+            return True, "I could not read the battery status, sir.", False
+
+        if "storage" in lowered_command:
+            total, used, free = shutil.disk_usage("/")
+            return True, f"You have {format_bytes(free)} free out of {format_bytes(total)} total storage, sir.", False
+
+        if "ram" in lowered_command:
+            if psutil is None:
+                return True, "psutil is not installed, so I cannot read memory usage, sir.", False
+            memory = psutil.virtual_memory()
+            return True, f"You are using {format_bytes(memory.used)} of {format_bytes(memory.total)} RAM, sir.", False
+
+        if lowered_command == "cpu usage":
+            if psutil is None:
+                return True, "psutil is not installed, so I cannot read CPU usage, sir.", False
+            return True, f"CPU usage is {psutil.cpu_percent(interval=1):.0f} percent, sir.", False
+
+        if "what processes are running" in lowered_command:
+            if psutil is None:
+                return True, "psutil is not installed, so I cannot inspect processes, sir.", False
+            processes = []
+            for process in psutil.process_iter(["name"]):
+                try:
+                    process.cpu_percent(interval=None)
+                    processes.append(process)
+                except Exception:
+                    continue
+            time.sleep(0.2)
+            ranked = []
+            for process in processes:
+                try:
+                    ranked.append((process.cpu_percent(interval=None), process.info.get("name") or "Unknown"))
+                except Exception:
+                    continue
+            top_processes = sorted(ranked, key=lambda item: item[0], reverse=True)[:5]
+            if not top_processes:
+                return True, "I could not determine the active processes, sir.", False
+            spoken = ", ".join(f"{name} at {cpu:.0f} percent" for cpu, name in top_processes)
+            return True, f"Top processes right now are {spoken}.", False
+
+        return False, "", False
+
+    def handle_file_management_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle file and folder operations using natural language patterns.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches filesystem failures and returns friendly responses.
+        """
+        rename_match = re.search(r"(?:rename|change the name of)\s+(.+?)\s+to\s+(.+)", cleaned_command, flags=re.IGNORECASE)
+        if rename_match:
+            old_name = clean_spoken_entity(rename_match.group(1))
+            new_name = clean_spoken_entity(rename_match.group(2))
+            source_path = self.resolve_existing_target(old_name, include_files=True, include_dirs=True)
+            if source_path is None:
+                return True, f"I could not find {old_name}, sir.", False
+            try:
+                target_path = source_path.with_name(new_name)
+                os.rename(source_path, target_path)
+                return True, f"Done sir. {source_path.name} has been renamed to {new_name}.", False
+            except Exception as error:
+                self.logger.error("Rename failed: %s", error)
+                return True, "I could not rename that item, sir.", False
+
+        move_match = re.search(r"(?:move|put|send)\s+(.+?)\s+(?:to|in)\s+(.+)", cleaned_command, flags=re.IGNORECASE)
+        if move_match:
+            item_name = clean_spoken_entity(move_match.group(1))
+            destination_name = clean_spoken_entity(move_match.group(2))
+            source_path = self.resolve_existing_target(item_name, include_files=True, include_dirs=True)
+            destination_path = self.resolve_destination_path(destination_name)
+            if source_path is None:
+                return True, f"I could not find {item_name}, sir.", False
+            if destination_path is None:
+                return True, f"I could not resolve the destination {destination_name}, sir.", False
+            try:
+                shutil.move(str(source_path), str(destination_path))
+                return True, f"Moved. {source_path.name} is now in {destination_path}.", False
+            except Exception as error:
+                self.logger.error("Move failed: %s", error)
+                return True, "I could not move that item, sir.", False
+
+        copy_match = re.search(
+            r"(?:copy|duplicate)\s+(.+?)\s+to\s+(.+)|make a copy of\s+(.+?)\s+in\s+(.+)",
+            cleaned_command,
+            flags=re.IGNORECASE,
+        )
+        if copy_match:
+            item_name = clean_spoken_entity(copy_match.group(1) or copy_match.group(3) or "")
+            destination_name = clean_spoken_entity(copy_match.group(2) or copy_match.group(4) or "")
+            source_path = self.resolve_existing_target(item_name, include_files=True, include_dirs=True)
+            destination_path = self.resolve_destination_path(destination_name)
+            if source_path is None:
+                return True, f"I could not find {item_name}, sir.", False
+            if destination_path is None:
+                return True, f"I could not resolve the destination {destination_name}, sir.", False
+            try:
+                if source_path.is_dir():
+                    shutil.copytree(source_path, destination_path / source_path.name, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(source_path, destination_path / source_path.name)
+                return True, "Copy complete sir.", False
+            except Exception as error:
+                self.logger.error("Copy failed: %s", error)
+                return True, "I could not copy that item, sir.", False
+
+        delete_match = re.search(r"(?:delete|remove|trash)\s+(.+)", cleaned_command, flags=re.IGNORECASE)
+        if delete_match:
+            item_name = clean_spoken_entity(delete_match.group(1))
+            target_path = self.resolve_existing_target(item_name, include_files=True, include_dirs=True)
+            if target_path is None:
+                return True, f"I could not find {item_name}, sir.", False
+            if not self.ask_confirmation(
+                f"Are you sure you want to delete {target_path.name}? Say yes to confirm."
+            ):
+                return True, "Deletion cancelled sir.", False
+            if self.trash_path(target_path):
+                return True, f"Done. {target_path.name} has been moved to the Trash.", False
+            return True, "I could not move that item to the Trash, sir.", False
+
+        folder_match = re.search(
+            r"(?:create a folder called|create a folder named|make a new folder called|make a new folder named|new folder)\s+(.+)",
+            cleaned_command,
+            flags=re.IGNORECASE,
+        )
+        if folder_match:
+            remainder = folder_match.group(1).strip()
+            location_match = re.search(r"(.+?)\s+(?:on|in|at)\s+(.+)", remainder, flags=re.IGNORECASE)
+            folder_name = clean_spoken_entity(location_match.group(1) if location_match else remainder)
+            destination_root = self.desktop_path
+            if location_match:
+                resolved_destination = self.resolve_destination_path(location_match.group(2))
+                if resolved_destination is None:
+                    return True, "I could not resolve that folder location, sir.", False
+                destination_root = resolved_destination
+            try:
+                target_folder = destination_root / folder_name
+                os.makedirs(target_folder, exist_ok=True)
+                if destination_root == self.desktop_path:
+                    return True, f"Created. New folder {folder_name} is on your Desktop.", False
+                return True, f"Created. New folder {folder_name} is in {destination_root}.", False
+            except Exception as error:
+                self.logger.error("Folder creation failed: %s", error)
+                return True, "I could not create that folder, sir.", False
+
+        find_match = re.search(r"(?:find|where is|locate|search for file)\s+(.+)", cleaned_command, flags=re.IGNORECASE)
+        if find_match:
+            item_name = clean_spoken_entity(find_match.group(1))
+            target_path = self.resolve_existing_target(item_name, include_files=True, include_dirs=True)
+            if target_path is None:
+                return True, f"I couldn't find {item_name} sir.", False
+            return True, f"Found it. {target_path.name} is located at {target_path}.", False
+
+        folder_list_match = re.search(
+            r"(?:what's in|list contents of|show me what's in)\s+(.+)",
+            cleaned_command,
+            flags=re.IGNORECASE,
+        )
+        finder_match = re.search(r"open\s+(.+?)\s+in finder", cleaned_command, flags=re.IGNORECASE)
+        if folder_list_match or finder_match:
+            folder_name = clean_spoken_entity(
+                folder_list_match.group(1) if folder_list_match else finder_match.group(1)
+            )
+            folder_path = self.resolve_existing_target(folder_name, include_files=False, include_dirs=True)
+            if folder_path is None:
+                return True, f"I could not find the folder {folder_name}, sir.", False
+            try:
+                items = sorted(path.name for path in folder_path.iterdir())
+                preview = ", ".join(items[:5]) if items else "nothing yet"
+                subprocess.run(["open", str(folder_path)], check=True)
+                if len(items) > 5:
+                    return True, f"Your {folder_path.name} contains: {preview}, and {len(items) - 5} more items.", False
+                return True, f"Your {folder_path.name} contains: {preview}.", False
+            except Exception as error:
+                self.logger.error("Folder listing failed: %s", error)
+                return True, "I could not open that folder, sir.", False
+
+        if lowered_command in {"organize my desktop", "clean up desktop", "sort my desktop"}:
+            if not self.ask_confirmation("Are you sure you want me to organize your Desktop? Say yes to confirm."):
+                return True, "Desktop organization cancelled sir.", False
+            try:
+                folders = {
+                    "Images": {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic"},
+                    "Documents": {".pdf", ".doc", ".docx", ".txt", ".rtf", ".ppt", ".pptx", ".xls", ".xlsx"},
+                    "Videos": {".mp4", ".mov", ".mkv", ".avi", ".webm"},
+                    "Others": set(),
+                }
+                for folder_name in folders:
+                    (self.desktop_path / folder_name).mkdir(exist_ok=True)
+                for item in self.desktop_path.iterdir():
+                    if item.is_dir() or item.name in folders:
+                        continue
+                    target_folder = self.desktop_path / "Others"
+                    for folder_name, extensions in folders.items():
+                        if item.suffix.lower() in extensions:
+                            target_folder = self.desktop_path / folder_name
+                            break
+                    shutil.move(str(item), str(target_folder / item.name))
+                return True, "I've organized your Desktop into 4 folders sir.", False
+            except Exception as error:
+                self.logger.error("Desktop organization failed: %s", error)
+                return True, "I could not organize your Desktop, sir.", False
+
+        open_match = re.search(r"(?:open|launch)(?: the file)?\s+(.+)", cleaned_command, flags=re.IGNORECASE)
+        if open_match and "browser" not in lowered_command and "finder" not in lowered_command:
+            target_name = clean_spoken_entity(open_match.group(1))
+            target_path = self.resolve_existing_target(target_name, include_files=True, include_dirs=True)
+            if target_path is None:
+                return False, "", False
+            try:
+                subprocess.run(["open", str(target_path)], check=True)
+                return True, f"Opening {target_path.name}, sir.", False
+            except Exception as error:
+                self.logger.error("File open failed: %s", error)
+                return True, "I could not open that item, sir.", False
+
+        info_match = re.search(r"(?:tell me about|what is|file info)\s+(.+)", cleaned_command, flags=re.IGNORECASE)
+        if info_match:
+            target_name = clean_spoken_entity(info_match.group(1))
+            target_path = self.resolve_existing_target(target_name, include_files=True, include_dirs=True)
+            if target_path is None:
+                return False, "", False
+            try:
+                stats = target_path.stat()
+                created = datetime.datetime.fromtimestamp(stats.st_ctime).strftime("%B %d, %Y at %I:%M %p")
+                modified = datetime.datetime.fromtimestamp(stats.st_mtime).strftime("%B %d, %Y at %I:%M %p")
+                file_type = "folder" if target_path.is_dir() else (mimetypes.guess_type(target_path.name)[0] or target_path.suffix or "file")
+                return True, (
+                    f"{target_path.name} is a {file_type}. Size is {format_bytes(stats.st_size)}. "
+                    f"It was created on {created} and modified on {modified}."
+                ), False
+            except Exception as error:
+                self.logger.error("File info failed: %s", error)
+                return True, "I could not inspect that item, sir.", False
+
+        return False, "", False
+
+    def handle_clipboard_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle clipboard actions before AI fallback.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches clipboard failures and returns friendly responses.
+        """
+        if pyperclip is None:
+            return True, "pyperclip is not installed, so clipboard skills are unavailable, sir.", False
+
+        if lowered_command in {"what's in my clipboard", "read clipboard"}:
+            try:
+                clipboard_text = pyperclip.paste().strip()
+                if not clipboard_text:
+                    return True, "Your clipboard is empty, sir.", False
+                return True, f"Your clipboard contains: {clipboard_text}", False
+            except Exception as error:
+                self.logger.error("Clipboard read failed: %s", error)
+                return True, "I could not read the clipboard, sir.", False
+
+        if lowered_command == "clear clipboard":
+            try:
+                pyperclip.copy("")
+                return True, "Clipboard cleared, sir.", False
+            except Exception as error:
+                self.logger.error("Clipboard clear failed: %s", error)
+                return True, "I could not clear the clipboard, sir.", False
+
+        if lowered_command == "copy that":
+            try:
+                pyperclip.copy(self.last_response_text)
+                return True, "Copied the last response to your clipboard, sir.", False
+            except Exception as error:
+                self.logger.error("Clipboard copy failed: %s", error)
+                return True, "I could not copy that, sir.", False
+
+        return False, "", False
+
+    def handle_text_input_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle typing and keyboard shortcut commands.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method returns graceful failures when accessibility permissions are missing.
+        """
+        if lowered_command.startswith("type ") or lowered_command.startswith("write "):
+            text_to_type = cleaned_command.split(maxsplit=1)[1].strip() if " " in cleaned_command else ""
+            if not text_to_type:
+                return True, "Please tell me what you want typed, sir.", False
+            return self.perform_automation_action(lambda: pyautogui.typewrite(text_to_type), "Typed it, sir.")
+
+        shortcuts = {
+            "press enter": (lambda: pyautogui.press("enter"), "Enter pressed, sir."),
+            "press escape": (lambda: pyautogui.press("escape"), "Escape pressed, sir."),
+            "select all": (lambda: pyautogui.hotkey("command", "a"), "Selected everything, sir."),
+            "copy": (lambda: pyautogui.hotkey("command", "c"), "Copied, sir."),
+            "paste": (lambda: pyautogui.hotkey("command", "v"), "Pasted, sir."),
+            "undo": (lambda: pyautogui.hotkey("command", "z"), "Undone, sir."),
+        }
+        if lowered_command in shortcuts:
+            action, message = shortcuts[lowered_command]
+            return self.perform_automation_action(action, message)
+
+        return False, "", False
+
+    def handle_window_management_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle active-window and app-switch commands.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method returns friendly failures when shortcuts cannot be executed.
+        """
+        if lowered_command == "minimize window":
+            success = self.run_applescript('tell app "System Events" to keystroke "m" using command down')
+            return True, "Window minimized, sir." if success else "I could not minimize the window, sir.", False
+
+        window_actions = {
+            "close window": (lambda: pyautogui.hotkey("command", "w"), "Window closed, sir."),
+            "switch app": (lambda: pyautogui.hotkey("command", "tab"), "Switching applications, sir."),
+            "next app": (lambda: pyautogui.hotkey("command", "tab"), "Switching applications, sir."),
+            "show desktop": (lambda: pyautogui.hotkey("fn", "f11"), "Showing the desktop, sir."),
+            "full screen": (lambda: pyautogui.hotkey("command", "ctrl", "f"), "Toggling full screen, sir."),
+        }
+        if lowered_command in window_actions:
+            action, message = window_actions[lowered_command]
+            return self.perform_automation_action(action, message)
+
+        return False, "", False
+
+    def handle_network_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle internet checks, Wi-Fi details, and network settings.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches network helper failures and returns friendly responses.
+        """
+        if lowered_command in {"are we connected", "check internet"}:
+            if requests is None:
+                return True, "The requests package is not installed, so I cannot check the internet, sir.", False
+            try:
+                requests.get("https://8.8.8.8", timeout=3, verify=False)
+                return True, "Yes sir. The internet connection looks good.", False
+            except Exception:
+                return True, "No sir. I could not reach the internet.", False
+
+        if "wifi" in lowered_command:
+            try:
+                result = subprocess.run(
+                    [
+                        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
+                        "-I",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                match = re.search(r"\sSSID: (.+)", result.stdout)
+                if match:
+                    return True, f"You are connected to {match.group(1).strip()}, sir.", False
+            except Exception as error:
+                self.logger.error("Wi-Fi lookup failed: %s", error)
+            return True, "I could not determine the current Wi-Fi network, sir.", False
+
+        if "network settings" in lowered_command:
+            success = self.run_subprocess(["open", "x-apple.systempreferences:com.apple.preference.network"])
+            return True, "Opening Network Settings, sir." if success else "I could not open Network Settings, sir.", False
+
+        return False, "", False
+
+    def handle_calculation_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle safe calculations, conversions, percentages, and binary output.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches math parsing issues and falls back cleanly when needed.
+        """
+        binary_match = re.search(r"what'?s\s+(\d+)\s+in binary", lowered_command)
+        if binary_match:
+            number = int(binary_match.group(1))
+            return True, f"{number} in binary is {bin(number)}.", False
+
+        percent_match = re.search(r"what'?s\s+(\d+(?:\.\d+)?)\s+percent of\s+(\d+(?:\.\d+)?)", lowered_command)
+        if percent_match:
+            part = float(percent_match.group(1))
+            whole = float(percent_match.group(2))
+            result = (part / 100.0) * whole
+            return True, f"{format_result_number(part)} percent of {format_result_number(whole)} is {format_result_number(result)}.", False
+
+        convert_match = re.search(r"convert\s+(\d+(?:\.\d+)?)\s+([a-z]+)\s+to\s+([a-z]+)", lowered_command)
+        if convert_match:
+            value = float(convert_match.group(1))
+            from_unit = convert_match.group(2)
+            to_unit = convert_match.group(3)
+            conversions = {
+                ("km", "miles"): value * 0.621371,
+                ("kilometers", "miles"): value * 0.621371,
+                ("miles", "km"): value / 0.621371,
+                ("miles", "kilometers"): value / 0.621371,
+                ("kg", "lbs"): value * 2.20462,
+                ("kilograms", "lbs"): value * 2.20462,
+                ("lbs", "kg"): value / 2.20462,
+                ("pounds", "kg"): value / 2.20462,
+                ("celsius", "fahrenheit"): (value * 9 / 5) + 32,
+                ("fahrenheit", "celsius"): (value - 32) * 5 / 9,
+                ("usd", "inr"): value * 83.0,
+                ("inr", "usd"): value / 83.0,
+            }
+            converted = conversions.get((from_unit, to_unit))
+            if converted is None:
+                return True, "I can convert kilometers and miles, kilograms and pounds, Celsius and Fahrenheit, and USD and INR, sir.", False
+            return True, f"{format_result_number(value)} {from_unit} is {format_result_number(converted)} {to_unit}, sir.", False
+
+        expression = ""
+        if lowered_command.startswith("calculate "):
+            expression = cleaned_command[len("calculate ") :].strip()
+        elif lowered_command.startswith("what is "):
+            expression = cleaned_command[len("what is ") :].strip().rstrip("?")
+            if not re.fullmatch(r"[\d\s\.\+\-\*\/%\(\)]+", expression):
+                return False, "", False
+
+        if expression:
+            try:
+                result = safe_calculate(expression)
+                return True, f"The answer is {format_result_number(result)}, sir.", False
+            except Exception:
+                return True, "I could not calculate that safely, sir.", False
+
+        return False, "", False
+
+    def handle_notes_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle quick local note-taking commands.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches filesystem failures and returns friendly responses.
+        """
+        if lowered_command.startswith("make a note "):
+            content = cleaned_command[len("make a note ") :].strip()
+        elif lowered_command.startswith("note this down "):
+            content = cleaned_command[len("note this down ") :].strip()
+        else:
+            content = ""
+
+        if content:
+            try:
+                NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with NOTES_PATH.open("a", encoding="utf-8") as handle:
+                    handle.write(f"[{timestamp}] {content}\n")
+                return True, "Noted, sir.", False
+            except Exception as error:
+                self.logger.error("Note write failed: %s", error)
+                return True, "I could not save that note, sir.", False
+
+        if lowered_command in {"read my notes", "what are my notes"}:
+            try:
+                if not NOTES_PATH.exists():
+                    return True, "You do not have any notes yet, sir.", False
+                lines = [line.strip() for line in NOTES_PATH.read_text(encoding="utf-8").splitlines() if line.strip()]
+                if not lines:
+                    return True, "You do not have any notes yet, sir.", False
+                return True, f"Here are your latest notes, sir. {' '.join(lines[-5:])}", False
+            except Exception as error:
+                self.logger.error("Note read failed: %s", error)
+                return True, "I could not read your notes, sir.", False
+
+        if lowered_command == "clear my notes":
+            if not self.ask_confirmation("Are you sure you want to clear your notes? Say yes to confirm."):
+                return True, "Note clearing cancelled sir.", False
+            try:
+                NOTES_PATH.write_text("", encoding="utf-8")
+                return True, "Your notes are cleared, sir.", False
+            except Exception as error:
+                self.logger.error("Note clear failed: %s", error)
+                return True, "I could not clear your notes, sir.", False
+
+        return False, "", False
+
+    def handle_weather_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle simple weather requests through wttr.in.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches network failures and returns friendly responses.
+        """
+        if requests is None:
+            return True, "The requests package is not installed, so weather lookup is unavailable, sir.", False
+        try:
+            response = requests.get("https://wttr.in/Kolkata?format=3", timeout=5)
+            if response.ok:
+                return True, response.text.strip(), False
+        except Exception as error:
+            self.logger.error("Weather lookup failed: %s", error)
+        return True, "I could not fetch the weather right now, sir.", False
+
+    def handle_memory_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle PostgreSQL-backed memory skills and provider switches.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches local failures and returns friendly responses.
+        """
+        if lowered_command.startswith("remember that "):
+            fact_text = cleaned_command[len("remember that ") :].strip()
+            if not fact_text:
+                return True, "Please tell me what you would like me to remember, sir.", False
+            memory_key, memory_value, category = parse_memory_statement(fact_text)
+            if self.db_manager.save_memory(memory_key, memory_value, category):
+                return True, f"I will remember that {fact_text}, sir.", False
+            return True, "I could not store that memory, sir.", False
+
+        if lowered_command.startswith("do you remember "):
+            lookup_key = cleaned_command[len("do you remember ") :].strip().rstrip("?")
+            memory = self.db_manager.recall_memory(lookup_key)
+            if memory:
+                return True, f"Yes, sir. I remember that {format_memory_sentence(memory)}.", False
+            return True, f"I do not remember anything about {lookup_key}, sir.", False
+
+        if lowered_command.startswith("what do you know about "):
+            lookup_key = cleaned_command[len("what do you know about ") :].strip().rstrip("?")
+            memory = self.db_manager.recall_memory(lookup_key)
+            if memory:
+                return True, f"I remember that {format_memory_sentence(memory)}.", False
+            return True, f"I do not know anything about {lookup_key} yet, sir.", False
+
+        if lowered_command in {"what do you remember", "list your memories"}:
+            return True, self.db_manager.recall_all_memories(), False
+
+        if any(pattern in lowered_command for pattern in ["switch to groq", "use groq"]):
+            _, response_text = self.ai_router.switch_ai("groq")
+            return True, response_text, False
+
+        if any(pattern in lowered_command for pattern in ["switch to gemini", "use gemini"]):
+            _, response_text = self.ai_router.switch_ai("gemini")
+            return True, response_text, False
+
+        return False, "", False
+
+    def handle_timer_and_reminder_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle timers and reminders.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches local failures and returns friendly responses.
+        """
+        timer_match = re.search(r"set a timer for\s+(\d+)\s+(minute|minutes|second|seconds)", lowered_command)
+        if timer_match:
+            amount = int(timer_match.group(1))
+            unit = timer_match.group(2)
+            seconds = amount * 60 if "minute" in unit else amount
+            trigger_at = datetime.datetime.now() + datetime.timedelta(seconds=seconds)
+            timer_message = f"Sir, your {format_duration(seconds)} timer is complete."
+            reminder_id = self.db_manager.save_reminder(timer_message, trigger_at)
+            self.schedule_timer_alert(seconds, reminder_id, timer_message)
+            return True, f"Timer set for {format_duration(seconds)}, sir.", False
+
+        reminder_match = re.search(
+            r"remind me to\s+(.+?)\s+in\s+(\d+)\s+(minute|minutes|second|seconds)",
+            lowered_command,
+        )
+        if reminder_match:
+            reminder_action = reminder_match.group(1).strip()
+            amount = int(reminder_match.group(2))
+            unit = reminder_match.group(3)
+            seconds = amount * 60 if "minute" in unit else amount
+            trigger_at = datetime.datetime.now() + datetime.timedelta(seconds=seconds)
+            reminder_text = f"Reminder, sir. {reminder_action}."
+            self.db_manager.save_reminder(reminder_text, trigger_at)
+            return True, f"I will remind you to {reminder_action} in {format_duration(seconds)}, sir.", False
+
+        return False, "", False
+
+    def handle_app_launch_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle browser launches, Google searches, and app launches.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches launch failures and returns friendly responses.
+        """
+        if any(pattern in lowered_command for pattern in ["open browser", "open chrome", "open safari", "launch browser"]):
+            try:
+                webbrowser.open("https://www.google.com")
+                return True, "Opening your browser, sir.", False
+            except Exception as error:
+                self.logger.error("Browser launch failed: %s", error)
+                return True, "I could not open the browser, sir.", False
+
+        if lowered_command.startswith("search for ") or lowered_command.startswith("google "):
+            query = cleaned_command[11:].strip() if lowered_command.startswith("search for ") else cleaned_command[7:].strip()
+            if not query:
+                return True, "Tell me what you would like to search for, sir.", False
+            try:
+                webbrowser.open(f"https://www.google.com/search?q={quote_plus(query)}")
+                return True, f"Searching Google for {query}, sir.", False
+            except Exception as error:
+                self.logger.error("Google search failed: %s", error)
+                return True, "I could not open the search, sir.", False
+
+        app_match = re.match(r"^(open|launch)\s+(.+)$", lowered_command)
+        if app_match and all(keyword not in lowered_command for keyword in ["browser", "chrome", "safari"]):
+            app_name = cleaned_command.split(maxsplit=1)[1].strip()
+            if self.open_app(app_name):
+                return True, f"Opening {app_name}, sir.", False
+            return True, f"I could not open {app_name}, sir.", False
+
+        return False, "", False
+
+    def handle_fun_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle jokes, coin flips, dice rolls, motivation, and version checks.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        if lowered_command == "tell me a joke":
+            return True, random.choice(self.jokes), False
+
+        if lowered_command == "flip a coin":
+            return True, f"It is {random.choice(['heads', 'tails'])}, sir.", False
+
+        if lowered_command == "roll a dice":
+            return True, f"You rolled a {random.randint(1, 6)}, sir.", False
+
+        if lowered_command == "motivate me":
+            return True, random.choice(self.motivational_quotes), False
+
+        if lowered_command == "what version are you":
+            return True, f"I am JARVIS version {JARVIS_VERSION}, build date {JARVIS_BUILD_DATE}.", False
+
+        return False, "", False
+
+    def handle_builtin_skill(self, command: str) -> Tuple[bool, str, bool]:
+        """
+        Route local skills by ordered handler groups before falling back to AI.
+
+        Parameters:
+            command (str): The recognized user command.
+
+        Returns:
+            Tuple[bool, str, bool]: Handled flag, response text, and shutdown flag.
+
+        Exceptions:
+            This method catches local skill failures and returns a safe response.
+        """
+        cleaned_command = command.strip()
+        lowered_command = cleaned_command.lower()
+
+        for patterns, handler in self.skill_routes:
+            if any(pattern in lowered_command for pattern in patterns):
+                try:
+                    handled, response_text, should_shutdown = handler(cleaned_command, lowered_command)
+                    if handled:
+                        return handled, response_text, should_shutdown
+                except Exception as error:
+                    self.logger.error("Local skill failed in %s: %s", handler.__name__, error)
+                    self.logger.error(traceback.format_exc())
+                    return True, "I encountered a local skill error, sir.", False
+
+        return False, "", False
+
     def route_command(self, command: str) -> None:
         """
-        Route one recognized command through local skills or the AI stack.
+        Route one recognized command through ordered local skills or the AI stack.
 
         Parameters:
             command (str): The recognized command text.
@@ -2721,14 +5391,13 @@ class JarvisApp:
             # ── log the user's message to PostgreSQL for session history ──
             self.db_manager.log_conversation(self.session_id, "user", command, None)
 
-            # ── check fast local skills before any AI provider is contacted ──
+            # ── UPGRADED ── route by the requested local-skill priority before AI fallback ──
             handled, response_text, should_shutdown = self.handle_builtin_skill(command)
             if handled:
                 if should_shutdown:
                     self.request_shutdown("voice shutdown command")
                     return
-                self.db_manager.log_conversation(self.session_id, "assistant", response_text, None)
-                self.tts_engine.speak(response_text)
+                self.queue_response(response_text)
                 return
 
             # ── call the AI router when no local skill matches the request ──
@@ -2737,19 +5406,17 @@ class JarvisApp:
             # ── handle the case where both AI providers fail ──
             if reply_text is None:
                 offline_message = "Both AI systems are offline sir. Running on local skills only."
-                self.db_manager.log_conversation(self.session_id, "assistant", offline_message, None)
-                self.tts_engine.speak(offline_message)
+                self.queue_response(offline_message)
                 return
 
             # ── persist the AI reply and queue it for speech ──
-            self.db_manager.log_conversation(self.session_id, "assistant", reply_text, provider_used)
-            self.tts_engine.speak(reply_text)
+            self.queue_response(reply_text, provider_used)
         except Exception as error:
             # ── catch all command-routing failures so the assistant never crashes ──
             self.logger.error("Command routing failed: %s", error)
             self.logger.error(traceback.format_exc())
-            self.animator.set_state("error")
-            self.tts_engine.speak("I encountered an internal error, sir.")
+            self.animator.set_state("error", "Internal error")
+            self.queue_response("I encountered an internal error, sir.")
 
     def process_command_thread(self, inline_command: Optional[str] = None) -> None:
         """

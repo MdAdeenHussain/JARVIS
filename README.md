@@ -10,19 +10,16 @@
          Just A Rather Very Intelligent System
 ```
 
-JARVIS is a single-file, voice-activated AI assistant for macOS. It listens for the wake word `jarvis`, handles local Mac skills instantly, stores memory and reminders in PostgreSQL, and routes AI requests through Gemini first with Groq as a fallback.
+JARVIS is a voice-first macOS assistant built around one Python entrypoint: [jarvis.py](/Users/mohammadadeenhussain/Desktop/JARVIS/jarvis.py). It keeps local skills fast, stores memory and reminders in PostgreSQL, uses Gemini first with Groq fallback, and now drives both the terminal animation and an optional PyQt6 floating overlay from the same state machine.
 
 ## What This Upgrade Adds
 
-- `.env`-only secret management with `python-dotenv`
-- `.env.example` for safe onboarding
-- Gemini `gemini-1.5-flash` as the default AI path
-- Groq `llama3-8b-8192` as fallback when Gemini fails
-- PostgreSQL connection pooling with persistent memory, reminders, conversation logs, and AI usage tracking
-- Always-on wake listener thread
-- Reminder polling thread
-- Terminal animation system with idle, listening, thinking, speaking, and error states
-- Rotating `jarvis.log` file with provider switches and runtime diagnostics
+- Voice-controlled file and folder management with search, disambiguation, and Trash-safe deletion
+- A much larger local skill set for system control, clipboard, notes, networking, calculations, window actions, and fun commands
+- A PyQt6 floating overlay for macOS with listening, thinking, speaking, idle, and error states
+- `UI_MODE=both|terminal|overlay` so the terminal animation and overlay can run together or independently
+- Startup accessibility checks for keyboard automation skills
+- `.env.example` for onboarding and updated setup docs
 
 ## Project Files
 
@@ -39,11 +36,12 @@ JARVIS/
 ## macOS Requirements
 
 - macOS on Intel or Apple Silicon
-- Python 3.10 or newer recommended
+- Python 3.10 or newer
 - Homebrew
 - PostgreSQL
 - A working microphone
 - Terminal microphone permission
+- Accessibility permission if you want typing, copy/paste, app switching, or other keyboard automation
 
 ## 1. Install System Dependencies
 
@@ -53,16 +51,17 @@ Install the audio backend required by `PyAudio`:
 brew install portaudio
 ```
 
-Install PostgreSQL if it is not already installed:
+Install PostgreSQL if needed:
 
 ```bash
 brew install postgresql
+brew services start postgresql
 ```
 
-Start PostgreSQL:
+If you want brightness controls, install the `brightness` CLI too:
 
 ```bash
-brew services start postgresql
+brew install brightness
 ```
 
 ## 2. Create a PostgreSQL Database and User
@@ -73,8 +72,6 @@ Example setup:
 createuser -P jarvis_user
 createdb -O jarvis_user jarvis_db
 ```
-
-If you prefer to use your existing `postgres` user, that is fine too. Just make sure the values in `.env` match the database you actually created.
 
 ## 3. Create and Activate a Virtual Environment
 
@@ -92,13 +89,11 @@ pip install -r requirements.txt
 
 ## 5. Create Your `.env` File
 
-Copy the example file:
-
 ```bash
 cp .env.example .env
 ```
 
-Then edit `.env` and fill in every value:
+Then fill in every value:
 
 ```env
 # AI Providers
@@ -117,29 +112,25 @@ WAKE_WORD=jarvis
 VOICE_RATE=175
 HISTORY_LIMIT=10
 PRIMARY_AI=gemini
+UI_MODE=both
 ```
 
-Important:
+`UI_MODE` values:
 
-- Do not commit `.env`.
-- JARVIS exits at startup if any required `.env` value is missing.
-- The app never prints or logs your secret values.
+- `both`: terminal animation plus PyQt6 overlay
+- `terminal`: terminal animation only
+- `overlay`: overlay only, while regular console output still prints
 
-## 6. Get Free AI API Keys
+## 6. Accessibility Permissions
 
-### Gemini
+`pyautogui`-powered commands need Accessibility access.
 
-1. Go to https://aistudio.google.com/
-2. Sign in with your Google account
-3. Create an API key
-4. Paste it into `GEMINI_API_KEY`
+1. Open `System Settings`
+2. Go to `Privacy & Security`
+3. Open `Accessibility`
+4. Allow your terminal app or Python interpreter
 
-### Groq
-
-1. Go to https://console.groq.com/
-2. Sign up or sign in
-3. Create an API key
-4. Paste it into `GROQ_API_KEY`
+If JARVIS cannot use automation, it will disable those commands gracefully and tell you.
 
 ## 7. Run JARVIS
 
@@ -154,187 +145,144 @@ On startup JARVIS will:
 2. Load and validate `.env`
 3. Connect to PostgreSQL
 4. Initialize Gemini and Groq
-5. Start the terminal animation
+5. Start the terminal UI and optional overlay
 6. Start the reminder checker
-7. Print the system status panel
+7. Print the status panel
 8. Speak the startup message
 9. Begin always-on wake listening
 
+## Overlay UI
+
+The floating PyQt6 overlay is a dark frosted pill that appears near the bottom center of the screen. It has:
+
+- an indigo listening pulse with a drawn microphone icon
+- a rotating thinking arc with the current provider badge
+- animated equalizer bars while speaking
+- a low-opacity idle dot when JARVIS is quiet
+- shared state with the terminal animation, so both views stay in sync
+
+If `PyQt6` is not installed or the overlay cannot start, JARVIS falls back cleanly to terminal mode.
+
 ## Voice Commands
 
-### Time and date
+### File and folder management
 
-- `Jarvis, what time is it`
-- `Jarvis, current time`
-- `Jarvis, what's the date`
-- `Jarvis, what day is it`
+- `Jarvis, rename report to final report`
+- `Jarvis, change the name of notes folder to archive`
+- `Jarvis, move report to desktop`
+- `Jarvis, put invoices in documents`
+- `Jarvis, send budget.xlsx to downloads`
+- `Jarvis, copy report to documents`
+- `Jarvis, duplicate photos to desktop`
+- `Jarvis, make a copy of taxes in downloads`
+- `Jarvis, delete report`
+- `Jarvis, trash old screenshots`
+- `Jarvis, create a folder called Projects`
+- `Jarvis, make a new folder named Receipts in documents`
+- `Jarvis, find budget`
+- `Jarvis, where is passport scan`
+- `Jarvis, what's in desktop`
+- `Jarvis, open downloads in finder`
+- `Jarvis, open report.pdf`
+- `Jarvis, tell me about report.pdf`
+- `Jarvis, file info budget.xlsx`
+- `Jarvis, organize my desktop`
 
-### Browser and apps
+### System control
 
-- `Jarvis, open browser`
-- `Jarvis, open chrome`
-- `Jarvis, open safari`
-- `Jarvis, open Terminal`
-- `Jarvis, launch Music`
+- `Jarvis, increase volume`
+- `Jarvis, decrease volume`
+- `Jarvis, set volume to 40`
+- `Jarvis, mute`
+- `Jarvis, unmute`
+- `Jarvis, increase brightness`
+- `Jarvis, decrease brightness`
+- `Jarvis, lock screen`
+- `Jarvis, sleep computer`
+- `Jarvis, empty trash`
+- `Jarvis, what's my IP address`
+- `Jarvis, what's my battery`
+- `Jarvis, how much storage do I have`
+- `Jarvis, how much RAM am I using`
+- `Jarvis, CPU usage`
+- `Jarvis, what processes are running`
 
-### Screenshots
+### Clipboard and writing
 
-- `Jarvis, take a screenshot`
-- `Jarvis, screenshot`
+- `Jarvis, what's in my clipboard`
+- `Jarvis, clear clipboard`
+- `Jarvis, copy that`
+- `Jarvis, type meeting starts at 3 PM`
+- `Jarvis, press enter`
+- `Jarvis, press escape`
+- `Jarvis, select all`
+- `Jarvis, copy`
+- `Jarvis, paste`
+- `Jarvis, undo`
 
-### Timers and reminders
+### Window and network control
 
-- `Jarvis, set a timer for 5 minutes`
-- `Jarvis, set a timer for 30 seconds`
-- `Jarvis, remind me to stretch in 10 minutes`
-- `Jarvis, remind me to check the oven in 45 seconds`
+- `Jarvis, minimize window`
+- `Jarvis, close window`
+- `Jarvis, switch app`
+- `Jarvis, show desktop`
+- `Jarvis, full screen`
+- `Jarvis, are we connected`
+- `Jarvis, what wifi am I on`
+- `Jarvis, open network settings`
 
-### Memory
+### Calculations, notes, and weather
+
+- `Jarvis, calculate 22 / 7`
+- `Jarvis, what is 15 * (4 + 2)`
+- `Jarvis, what's 18 percent of 240`
+- `Jarvis, convert 5 km to miles`
+- `Jarvis, convert 10 celsius to fahrenheit`
+- `Jarvis, convert 100 usd to inr`
+- `Jarvis, make a note buy almond milk`
+- `Jarvis, read my notes`
+- `Jarvis, clear my notes`
+- `Jarvis, what's the weather`
+- `Jarvis, will it rain`
+
+### Memory, reminders, apps, and fun
 
 - `Jarvis, remember that my dog's name is Bruno`
 - `Jarvis, do you remember my dog's name`
 - `Jarvis, what do you know about my dog's name`
-- `Jarvis, what do you remember`
-- `Jarvis, list your memories`
-
-### AI provider control
-
+- `Jarvis, set a timer for 5 minutes`
+- `Jarvis, remind me to stretch in 10 minutes`
+- `Jarvis, open browser`
+- `Jarvis, search for best espresso near me`
+- `Jarvis, open Terminal`
 - `Jarvis, switch to groq`
 - `Jarvis, switch to gemini`
-- `Jarvis, use groq`
-- `Jarvis, use gemini`
-
-### System and shutdown
-
-- `Jarvis, system status`
-- `Jarvis, jarvis status`
-- `Jarvis, goodbye`
-- `Jarvis, shut down`
-- `Jarvis, that's all`
-
-### Everything else
-
-Any command that does not match a built-in skill is sent to AI:
-
-- `Jarvis, explain quantum entanglement`
-- `Jarvis, summarize the differences between Flask and FastAPI`
-- `Jarvis, write a Python function to merge two sorted lists`
+- `Jarvis, tell me a joke`
+- `Jarvis, flip a coin`
+- `Jarvis, roll a dice`
+- `Jarvis, what's 42 in binary`
+- `Jarvis, motivate me`
+- `Jarvis, what version are you`
 
 ## AI Routing Behavior
 
-- JARVIS keeps separate histories for Gemini and Groq
+- Local skills are checked before any AI call
 - Gemini is attempted first by default
-- If Gemini fails, JARVIS automatically falls back to Groq
+- Groq takes over automatically if Gemini fails
 - If both fail, JARVIS says: `Both AI systems are offline sir. Running on local skills only.`
-- You can manually override the preferred provider with a voice command
-- Every provider switch is written to `jarvis.log`
+- Manual provider switches are written to [jarvis.log](/Users/mohammadadeenhussain/Desktop/JARVIS/jarvis.log)
 
 ## PostgreSQL Schema
 
-JARVIS creates these tables automatically on startup:
+JARVIS creates these tables automatically:
 
 - `memory`
 - `conversation_log`
 - `ai_usage`
 - `reminders`
 
-This means:
+## Main Files
 
-- memories persist across runs
-- conversations are stored per session
-- AI performance is tracked
-- reminders survive restarts
-
-## Logging
-
-JARVIS writes logs to `jarvis.log` with rotation at 5 MB.
-
-Logged events include:
-
-- AI provider switches
-- PostgreSQL errors
-- failed AI calls
-- reminder firings
-- session start and end
-
-JARVIS does not log:
-
-- API keys
-- `.env` secrets
-- user speech content to the log file
-- personal memory values to the log file
-
-## Troubleshooting
-
-### `PyAudio` fails to install
-
-Make sure `portaudio` is installed first:
-
-```bash
-brew install portaudio
-```
-
-Then reinstall:
-
-```bash
-pip install PyAudio==0.2.14
-```
-
-### PostgreSQL connection fails
-
-Check:
-
-- PostgreSQL is running: `brew services start postgresql`
-- your `.env` values match the real host, user, password, port, and database
-- your database user has permission to access `jarvis_db`
-
-### JARVIS cannot hear you
-
-Enable microphone access for Terminal:
-
-- `System Settings -> Privacy & Security -> Microphone`
-
-### Gemini or Groq requests fail
-
-Check:
-
-- your API keys are valid
-- your internet connection is working
-- the provider is not rate-limited or temporarily unavailable
-
-If Gemini fails, JARVIS automatically falls back to Groq.
-
-## Security Notes
-
-- All secrets are loaded only from `.env`
-- `.env` is ignored by Git
-- `.env.example` is safe to commit
-- No API key is hardcoded anywhere in `jarvis.py`
-
-## Run Summary for Your MacBook Air 2017
-
-Once everything is configured, your normal test flow is:
-
-```bash
-cd /Users/mohammadadeenhussain/Desktop/JARVIS
-source venv/bin/activate
-python jarvis.py
-```
-
-Then say:
-
-```text
-Jarvis
-```
-
-And follow with:
-
-```text
-what time is it
-```
-
-or:
-
-```text
-system status
-```
+- Core assistant: [jarvis.py](/Users/mohammadadeenhussain/Desktop/JARVIS/jarvis.py)
+- Package list: [requirements.txt](/Users/mohammadadeenhussain/Desktop/JARVIS/requirements.txt)
+- Environment template: [.env.example](/Users/mohammadadeenhussain/Desktop/JARVIS/.env.example)
