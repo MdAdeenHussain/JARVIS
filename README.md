@@ -1,5 +1,6 @@
-<div align="center">
-```
+# JARVIS AI Assistant
+
+```text
      ██╗ █████╗ ██████╗ ██╗   ██╗██╗███████╗
      ██║██╔══██╗██╔══██╗██║   ██║██║██╔════╝
      ██║███████║██████╔╝██║   ██║██║███████╗
@@ -9,288 +10,200 @@
          Just A Rather Very Intelligent System
 ```
 
-# JARVIS AI Assistant
+JARVIS is a single-file Python voice assistant for macOS. It listens for the wake word `jarvis`, handles common commands locally, uses Claude for open-ended questions, and now stores long-term memory in PostgreSQL instead of SQLite.
 
-**A fully voice-activated, offline-capable AI assistant for macOS — built in Python, powered by Claude AI.**
+## Recent Updates
 
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=flat-square&logo=python)](https://www.python.org/)
-[![Claude AI](https://img.shields.io/badge/AI-Claude%20API-blueviolet?style=flat-square)](https://console.anthropic.com/)
-[![Platform](https://img.shields.io/badge/Platform-macOS-lightgrey?style=flat-square&logo=apple)](https://www.apple.com/macos/)
-[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Active-brightgreen?style=flat-square)]()
+- Built the assistant as a single heavily commented file: `jarvis.py`
+- Added wake-word listening, Google speech recognition, Claude chat fallback, timers, screenshots, browser/app launchers, and memory commands
+- Switched memory storage from SQLite to PostgreSQL
+- Expanded `config.json` with PostgreSQL connection settings
+- Auto-creates the PostgreSQL `memory` table when the app starts and a database connection is available
+- Installed the core audio and AI dependencies in the local `venv`
+- Added Homebrew `portaudio` support for `PyAudio`
 
-*"JARVIS online. All systems operational. How can I assist you?"*
+## Project Files
 
-</div>
+```text
+JARVIS/
+├── jarvis.py
+├── config.json
+├── jarvis_memory.db
+├── README.md
+├── LICENSE
+└── venv/
+```
 
----
+Notes:
 
-## What is this?
-
-JARVIS is a personal AI assistant you run locally on your Mac from the terminal. You talk to it, it talks back. It understands natural language, remembers things you tell it, controls your Mac, and connects to Claude AI for anything it can't handle on its own — all triggered by saying the wake word **"JARVIS"**.
-
-Built as a single Python file with beginner-friendly comments throughout, it's designed to be easy to understand, easy to modify, and genuinely useful out of the box.
-
----
+- `jarvis.py` is the main program.
+- `config.json` stores the Claude API key and PostgreSQL settings.
+- `jarvis_memory.db` is a leftover file from the earlier SQLite version and is no longer used by the app.
 
 ## Features
 
-| Feature | Description |
-|---|---|
-| 🎙️ Wake word detection | Say "JARVIS" to activate — no button pressing needed |
-| 🧠 Claude AI brain | Powered by Anthropic's Claude API for natural conversation |
-| 🔊 Offline voice output | Uses macOS built-in voices via `pyttsx3` — no internet needed to speak |
-| 💾 Persistent memory | SQLite database remembers facts across sessions |
-| ⚡ Built-in skills | Time, date, timers, screenshots, app launching and more — no API call needed |
-| 🌐 Web search | Opens Google searches directly from voice commands |
-| 📝 Conversation history | Remembers context within a session (last 10 messages) |
-| 🛡️ Fully error-handled | Every failure is caught and spoken aloud — it never crashes silently |
-| ⚙️ Config file | Easy `config.json` setup — change wake word, voice speed, and more |
-
----
-
-## Demo
-```
-> python jarvis.py
-
-     ██╗ █████╗ ██████╗ ██╗   ██╗██╗███████╗
-     ...
-         Just A Rather Very Intelligent System
-
-[JARVIS] Online. Listening for wake word: "jarvis"
-
-You: Jarvis, what time is it?
-JARVIS: It's 3:42 PM, sir.
-
-You: Jarvis, remember that my wife's name is Sarah.
-JARVIS: Got it. I'll remember that Sarah is your wife.
-
-You: Jarvis, do you remember my wife's name?
-JARVIS: Of course. Your wife's name is Sarah.
-
-You: Jarvis, set a timer for 5 minutes.
-JARVIS: Timer set for 5 minutes. I'll let you know when it's up.
-
-You: Jarvis, search for Python tutorials.
-JARVIS: Opening Google search for Python tutorials.
-
-You: Jarvis, explain how black holes work.
-JARVIS: Certainly. A black hole is a region of spacetime where gravity...
-```
-
----
+- Wake word detection with simple string matching
+- Voice input through `SpeechRecognition` and `PyAudio`
+- Offline speech output through `pyttsx3`
+- Claude integration with `claude-sonnet-4-20250514`
+- Session conversation history limited by config
+- PostgreSQL-backed memory storage
+- Built-in local skills for time, date, search, timers, screenshots, and app launching
+- Graceful shutdown and broad error handling
 
 ## Requirements
 
-- macOS (any version — tested on macOS Ventura and Sonoma)
-- Python 3.9 or higher
-- A free Claude API key from [console.anthropic.com](https://console.anthropic.com)
-- A working microphone
-- Internet connection (for speech recognition and Claude API calls only)
+- macOS
+- Python 3.10 or newer recommended
+- Homebrew
+- PostgreSQL running locally or reachable over the network
+- A Claude API key
+- Microphone permission for Terminal
 
-> Works on MacBook Air 2017 (Intel, 8GB RAM) and any newer Mac including M1/M2/M3.
+## Python Dependencies
 
----
+Install these into your virtual environment:
 
-## Installation
-
-### Step 1 — Clone the repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/JARVIS-AI-Assistant.git
-cd JARVIS-AI-Assistant
+pip install SpeechRecognition pyttsx3 pyaudio anthropic requests psycopg2-binary
 ```
 
-### Step 2 — Install PortAudio (required for microphone access on Mac)
+## System Dependencies
+
+Install the microphone backend dependency:
+
 ```bash
 brew install portaudio
 ```
-> Don't have Homebrew? Install it first:
-> ```bash
-> /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-> ```
 
-### Step 3 — Install Python dependencies
+Install PostgreSQL if you do not already have it:
+
 ```bash
-pip install SpeechRecognition pyttsx3 pyaudio anthropic requests
+brew install postgresql
 ```
 
-### Step 4 — Run JARVIS for the first time
+Then start PostgreSQL and create a database for JARVIS:
+
 ```bash
-python jarvis.py
-```
-On first launch, a `config.json` file is automatically created. The program will pause and ask you to add your API key.
-
-### Step 5 — Add your Claude API key
-Open `config.json` in any text editor:
-```json
-{
-  "api_key": "YOUR_CLAUDE_API_KEY_HERE",
-  "wake_word": "jarvis",
-  "voice_rate": 175,
-  "history_limit": 10
-}
-```
-Get your free API key at [console.anthropic.com](https://console.anthropic.com), paste it in, save the file, and run `python jarvis.py` again.
-
----
-
-## Voice Commands
-
-### Built-in commands (instant, no API call)
-| Say this | What happens |
-|---|---|
-| `"Jarvis, what time is it?"` | Speaks the current time |
-| `"Jarvis, what's the date?"` | Speaks today's date |
-| `"Jarvis, open browser"` | Opens your default browser |
-| `"Jarvis, open terminal"` | Opens a new Terminal window |
-| `"Jarvis, play music"` | Opens the macOS Music app |
-| `"Jarvis, take a screenshot"` | Saves a screenshot to your desktop |
-| `"Jarvis, set a timer for 10 minutes"` | Sets a spoken countdown timer |
-| `"Jarvis, search for [anything]"` | Opens a Google search |
-| `"Jarvis, remember that [fact]"` | Saves a fact to memory |
-| `"Jarvis, do you remember [topic]?"` | Recalls a saved memory |
-| `"Jarvis, goodbye"` | Shuts down gracefully |
-
-### AI-powered commands (anything else)
-Anything that doesn't match a built-in command is sent to Claude AI automatically. Ask it anything:
-- *"Jarvis, explain quantum computing in simple terms."*
-- *"Jarvis, write me a Python function that sorts a list."*
-- *"Jarvis, what should I make for dinner with chicken and rice?"*
-- *"Jarvis, translate 'hello' into Japanese."*
-
----
-
-## Project Structure
-```
-JARVIS-AI-Assistant/
-│
-├── jarvis.py          # The entire program — single file, heavily commented
-├── config.json        # Auto-generated on first run — add your API key here
-├── jarvis_memory.db   # Auto-generated SQLite database for persistent memory
-├── requirements.txt   # All pip dependencies
-├── LICENSE            # MIT License
-└── README.md          # This file
+brew services start postgresql
+createdb jarvis
 ```
 
----
+If you prefer a different database name, user, host, or port, update `config.json` accordingly.
 
 ## Configuration
 
-Edit `config.json` to customise JARVIS:
+`config.json` now contains both assistant settings and PostgreSQL connection settings:
+
 ```json
 {
-  "api_key": "sk-ant-...",
-  "wake_word": "jarvis",
-  "voice_rate": 175,
-  "history_limit": 10
+    "api_key": "",
+    "wake_word": "jarvis",
+    "voice_rate": 175,
+    "history_limit": 10,
+    "db_host": "localhost",
+    "db_port": 5432,
+    "db_name": "jarvis",
+    "db_user": "postgres",
+    "db_password": "",
+    "db_sslmode": "prefer"
 }
 ```
 
-| Key | Default | Description |
-|---|---|---|
-| `api_key` | `""` | Your Claude API key from Anthropic |
-| `wake_word` | `"jarvis"` | The word that activates JARVIS (change to anything you like) |
-| `voice_rate` | `175` | Speech speed in words per minute (150–200 recommended) |
-| `history_limit` | `10` | How many messages of conversation history to keep per session |
+Field guide:
 
----
+- `api_key`: your Anthropic Claude API key
+- `wake_word`: the activation word JARVIS listens for
+- `voice_rate`: pyttsx3 speech speed
+- `history_limit`: how many recent Claude messages stay in memory for the current session
+- `db_host`: PostgreSQL host
+- `db_port`: PostgreSQL port
+- `db_name`: PostgreSQL database name
+- `db_user`: PostgreSQL username
+- `db_password`: PostgreSQL password
+- `db_sslmode`: PostgreSQL SSL mode such as `prefer`, `require`, or `disable`
 
-## How it works
-```
-You speak
-    ↓
-Microphone captures audio (PyAudio)
-    ↓
-Google Speech Recognition converts audio → text
-    ↓
-Wake word check: does the text contain "jarvis"?
-    ↓ yes
-Command router checks for built-in skill match
-    ↓ no match
-Claude API processes the input + conversation history
-    ↓
-Response text sent to pyttsx3
-    ↓
-macOS voice speaks the response aloud
-    ↓
-Response + your message saved to conversation history
-    ↓
-Loop — back to listening
-```
+## Running JARVIS
 
----
+If you want to use the local virtual environment already present in this repository:
 
-## Extending JARVIS
-
-Adding a new skill is straightforward. Inside `jarvis.py`, find the `# ── BUILT-IN SKILLS ──` section and add a new block:
-```python
-# Check if the user wants to know the weather
-elif "weather" in command or "forecast" in command:
-    # Call a weather API here and return the result
-    return get_weather()  # implement this function above
-```
-
-Because every section is clearly commented, you'll know exactly where each piece of the code lives.
-
----
-
-## Troubleshooting
-
-**`PyAudio` installation fails**
 ```bash
-brew install portaudio
-pip install --global-option='build_ext' --global-option='-I/usr/local/include' --global-option='-L/usr/local/lib' pyaudio
+source venv/bin/activate
+python jarvis.py
 ```
 
-**JARVIS can't hear me / microphone not working**
-Go to System Settings → Privacy & Security → Microphone and make sure Terminal (or your IDE) has microphone access enabled.
+On startup JARVIS will:
 
-**Speech recognition returns errors**
-Make sure you have an active internet connection — Google's free speech recognition requires it.
+- print the banner
+- load `config.json`
+- connect to PostgreSQL and create the `memory` table if possible
+- initialize speech and AI services
+- start listening for the wake word
 
-**Claude API returns an auth error**
-Double-check your API key in `config.json`. Make sure there are no extra spaces. Generate a new key at [console.anthropic.com](https://console.anthropic.com) if needed.
+## PostgreSQL Memory Table
 
----
+JARVIS creates this table automatically:
 
-## Roadmap
+```sql
+CREATE TABLE IF NOT EXISTS memory (
+    id SERIAL PRIMARY KEY,
+    "key" TEXT NOT NULL,
+    "value" TEXT NOT NULL,
+    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
 
-- [ ] GUI dashboard using `tkinter`
-- [ ] Spotify / Apple Music playback control
-- [ ] Email reading via Gmail API
-- [ ] Weather skill via OpenWeatherMap API
-- [ ] Calendar integration via macOS Calendar
-- [ ] Custom wake word training
-- [ ] Home Assistant / smart home integration
-- [ ] Whisper API for better offline speech recognition
+Memory commands:
 
----
+- `Jarvis, remember that my dog's name is Bruno`
+- `Jarvis, do you remember my dog's name?`
+- `Jarvis, what do you know about Bruno?`
 
-## Contributing
+## Built-in Commands
 
-Pull requests are welcome. For major changes, please open an issue first to discuss what you'd like to add. Make sure any new skills are commented in the same style as the existing code.
+- `what time is it`
+- `current time`
+- `what's the date`
+- `today's date`
+- `open browser`
+- `open chrome`
+- `open safari`
+- `open music`
+- `play music`
+- `open terminal`
+- `take a screenshot`
+- `remember that ...`
+- `do you remember ...`
+- `what do you know about ...`
+- `set a timer for N minutes`
+- `search for ...`
+- `google ...`
+- `stop`
+- `exit`
+- `goodbye`
+- `shut down`
 
----
+Anything else is sent to Claude.
 
-## License
+## Known Notes
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+- The code now uses PostgreSQL for memory. If PostgreSQL is unreachable or `psycopg2-binary` is missing, memory commands will fail gracefully instead of crashing the app.
+- `pyttsx3` is installed, but on some macOS and Python combinations its NSSpeech driver can still be temperamental. The script already falls back to terminal output if TTS initialization fails.
+- Speech recognition still depends on Google's online recognition service, so microphone transcription needs internet access.
 
----
+## Verification Done In This Repo
 
-## Acknowledgements
+- `jarvis.py` was updated to use PostgreSQL connection settings from `config.json`
+- `config.json` was updated with PostgreSQL defaults
+- The local `venv` has the voice and AI packages installed
+- `portaudio` was installed with Homebrew so `PyAudio` could build
+- The Python file has been syntax-checked successfully with `python3 -m py_compile jarvis.py`
 
-- [Anthropic](https://anthropic.com) for the Claude API
-- [SpeechRecognition](https://github.com/Mybridge/recognize-speech) library
-- [pyttsx3](https://github.com/nateshmbhat/pyttsx3) for offline TTS
-- Inspired by the fictional JARVIS from the Iron Man / MCU universe
+## Next Good Step
 
----
+Install `psycopg2-binary` into the same `venv` if it is not already present, start PostgreSQL, fill in your `config.json`, and then run:
 
-<div align="center">
-
-**Built with Python · Powered by Claude AI · Made for macOS**
-
-*"Sometimes you gotta run before you can walk." — Tony Stark*
-
-</div>
+```bash
+source venv/bin/activate
+python jarvis.py
+```

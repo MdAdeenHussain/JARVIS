@@ -13,7 +13,6 @@ import datetime
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import threading
 import webbrowser
@@ -44,18 +43,28 @@ try:
 except ImportError:
     anthropic = None
 
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
 
 # ── CONFIG LOADER ────────────────────────────────────────
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-DATABASE_PATH = os.path.join(BASE_DIR, "jarvis_memory.db")
 
 DEFAULT_CONFIG = {
     "api_key": "",
     "wake_word": "jarvis",
     "voice_rate": 175,
     "history_limit": 10,
+    "db_host": "localhost",
+    "db_port": 5432,
+    "db_name": "jarvis",
+    "db_user": "postgres",
+    "db_password": "",
+    "db_sslmode": "prefer",
 }
 
 SYSTEM_PROMPT = (
@@ -125,9 +134,20 @@ def load_config() -> Dict[str, Any]:
     except Exception:
         config["history_limit"] = DEFAULT_CONFIG["history_limit"]
 
+    # Keep the PostgreSQL port as an integer so database connections stay predictable.
+    try:
+        config["db_port"] = int(config.get("db_port", DEFAULT_CONFIG["db_port"]))
+    except Exception:
+        config["db_port"] = DEFAULT_CONFIG["db_port"]
+
     # Normalize the wake word so later string matching is simple and predictable.
     config["wake_word"] = str(config.get("wake_word", DEFAULT_CONFIG["wake_word"])).strip().lower()
     config["api_key"] = str(config.get("api_key", "")).strip()
+    config["db_host"] = str(config.get("db_host", DEFAULT_CONFIG["db_host"])).strip()
+    config["db_name"] = str(config.get("db_name", DEFAULT_CONFIG["db_name"])).strip()
+    config["db_user"] = str(config.get("db_user", DEFAULT_CONFIG["db_user"])).strip()
+    config["db_password"] = str(config.get("db_password", DEFAULT_CONFIG["db_password"]))
+    config["db_sslmode"] = str(config.get("db_sslmode", DEFAULT_CONFIG["db_sslmode"])).strip()
 
     # Rewrite the config if any required keys were missing.
     missing_keys = [key for key in DEFAULT_CONFIG if key not in config]
@@ -147,9 +167,41 @@ CONFIG = load_config()
 # ── DATABASE / MEMORY SETUP ──────────────────────────────
 
 
+def get_database_connection() -> Optional[Any]:
+    """
+    Open a PostgreSQL connection using values from config.json.
+
+    Parameters:
+        None.
+
+    Returns:
+        Optional[Any]: A live psycopg2 connection object, or None if the driver
+        is missing or the database connection fails.
+    """
+    # Stop early if the PostgreSQL driver is not installed yet.
+    if psycopg2 is None:
+        print("[MEMORY] psycopg2 is not installed. PostgreSQL memory is unavailable.")
+        return None
+
+    try:
+        # Read the database settings directly from the active config.
+        return psycopg2.connect(
+            host=CONFIG.get("db_host", "localhost"),
+            port=CONFIG.get("db_port", 5432),
+            dbname=CONFIG.get("db_name", "jarvis"),
+            user=CONFIG.get("db_user", "postgres"),
+            password=CONFIG.get("db_password", ""),
+            sslmode=CONFIG.get("db_sslmode", "prefer"),
+            connect_timeout=5,
+        )
+    except Exception as error:
+        print(f"[MEMORY] PostgreSQL connection failed: {error}")
+        return None
+
+
 def initialize_database() -> None:
     """
-    Create the SQLite memory database and table if they do not already exist.
+    Create the PostgreSQL memory table if it does not already exist.
 
     The table stores short facts the user asks JARVIS to remember. Each row
     includes a key, a value, and a timestamp so the latest memory can be found.
@@ -160,21 +212,23 @@ def initialize_database() -> None:
     Returns:
         None.
     """
-    # Connect to the database file in the same folder as this script.
-    connection = None
+    # Open a database connection using the PostgreSQL settings from config.json.
+    connection = get_database_connection()
+
+    if connection is None:
+        return
 
     try:
-        connection = sqlite3.connect(DATABASE_PATH)
         cursor = connection.cursor()
 
         # Create the memory table once and leave it in place for future runs.
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 "key" TEXT NOT NULL,
                 "value" TEXT NOT NULL,
-                timestamp TEXT NOT NULL
+                timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -190,7 +244,7 @@ def initialize_database() -> None:
 
 def save_memory(key: str, value: str) -> bool:
     """
-    Save a memory fact into SQLite.
+    Save a memory fact into PostgreSQL.
 
     Parameters:
         key (str): The short lookup phrase for the fact, such as "my wife's name".
@@ -200,16 +254,18 @@ def save_memory(key: str, value: str) -> bool:
         bool: True if the memory was saved successfully, otherwise False.
     """
     # Build a timestamp so we know when the memory was recorded.
-    timestamp = datetime.datetime.now().isoformat(timespec="seconds")
-    connection = None
+    timestamp = datetime.datetime.now()
+    connection = get_database_connection()
+
+    if connection is None:
+        return False
 
     try:
-        connection = sqlite3.connect(DATABASE_PATH)
         cursor = connection.cursor()
 
         # Insert the new memory as a fresh row so older memories are preserved too.
         cursor.execute(
-            'INSERT INTO memory ("key", "value", timestamp) VALUES (?, ?, ?)',
+            'INSERT INTO memory ("key", "value", timestamp) VALUES (%s, %s, %s)',
             (key.strip().lower(), value.strip(), timestamp),
         )
 
@@ -237,10 +293,12 @@ def recall_memory(key: str) -> Optional[Dict[str, str]]:
     """
     # Normalize the lookup phrase so searches are case-insensitive.
     cleaned_key = key.strip().lower()
-    connection = None
+    connection = get_database_connection()
+
+    if connection is None:
+        return None
 
     try:
-        connection = sqlite3.connect(DATABASE_PATH)
         cursor = connection.cursor()
 
         # First try an exact match because it gives the cleanest result.
@@ -248,7 +306,7 @@ def recall_memory(key: str) -> Optional[Dict[str, str]]:
             """
             SELECT "key", "value", timestamp
             FROM memory
-            WHERE lower("key") = ? OR lower("value") = ?
+            WHERE lower("key") = %s OR lower("value") = %s
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -263,7 +321,7 @@ def recall_memory(key: str) -> Optional[Dict[str, str]]:
                 """
                 SELECT "key", "value", timestamp
                 FROM memory
-                WHERE lower("key") LIKE ? OR lower("value") LIKE ?
+                WHERE lower("key") LIKE %s OR lower("value") LIKE %s
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -271,7 +329,7 @@ def recall_memory(key: str) -> Optional[Dict[str, str]]:
             )
             row = cursor.fetchone()
 
-        # Convert the SQLite row into a friendlier dictionary.
+        # Convert the PostgreSQL row into a friendlier dictionary.
         if row is not None:
             return {"key": row[0], "value": row[1], "timestamp": row[2]}
 
@@ -643,7 +701,7 @@ active_timers: List[threading.Timer] = []
 
 def parse_memory_fact(fact_text: str) -> Tuple[str, str, str]:
     """
-    Turn a raw remembered sentence into a key/value pair for SQLite.
+    Turn a raw remembered sentence into a key/value pair for PostgreSQL.
 
     Parameters:
         fact_text (str): The spoken fact after the words "remember that".
@@ -1032,6 +1090,16 @@ def startup_sequence() -> None:
     # Let the user know if AI mode is disabled because the key is missing.
     if not CONFIG.get("api_key"):
         print("[SYSTEM] Add your Claude API key to config.json to enable AI conversations.")
+
+    # Let the user know which PostgreSQL database JARVIS will try to use for memory.
+    print(
+        "[SYSTEM] PostgreSQL memory target: "
+        f"{CONFIG.get('db_user')}@{CONFIG.get('db_host')}:{CONFIG.get('db_port')}/{CONFIG.get('db_name')}"
+    )
+
+    # Warn early if the PostgreSQL driver is not installed.
+    if psycopg2 is None:
+        print("[SYSTEM] Install psycopg2-binary to enable PostgreSQL memory storage.")
 
     # Announce that the assistant is ready for voice commands.
     speak("JARVIS online. All systems operational. How can I assist you?")
