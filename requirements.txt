@@ -12,3 +12,6 @@ pyperclip==1.9.0
 pyautogui==0.9.54
 pathlib==1.0.1
 requests==2.32.3
+sentence-transformers==3.4.1
+pynput==1.7.7
+pgvector==0.3.6

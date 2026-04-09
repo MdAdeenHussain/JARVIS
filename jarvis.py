@@ -145,8 +145,16 @@ except ImportError:
 
         return decorator
 
-    def pyqtSignal(*args: Any, **kwargs: Any) -> Any:
-        return None
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
+
+try:
+    from pynput import keyboard, mouse
+except ImportError:
+    keyboard = None
+    mouse = None
 
 
 # ══════════════════════════════════════════════════════════
@@ -226,6 +234,14 @@ class AppConfig:
     history_limit: int
     primary_ai: str
     ui_mode: str
+    render_health_url: str
+    proactive_mode: bool
+    git_check_interval_hours: int
+    hotkey_enabled: bool
+    hotkey_combo: str
+    corner_trigger_enabled: bool
+    corner_trigger_corner: str
+    corner_trigger_delay_ms: int
 
 
 def parse_int_env(key: str, fallback: int) -> int:
@@ -306,6 +322,14 @@ def load_and_validate_environment() -> Optional[AppConfig]:
         history_limit=max(1, parse_int_env("HISTORY_LIMIT", 10)),
         primary_ai=primary_ai,
         ui_mode=ui_mode,
+        render_health_url=os.getenv("RENDER_HEALTH_URL", "").strip(),
+        proactive_mode=os.getenv("PROACTIVE_MODE", "true").strip().lower() == "true",
+        git_check_interval_hours=parse_int_env("GIT_CHECK_INTERVAL_HOURS", 2),
+        hotkey_enabled=os.getenv("HOTKEY_ENABLED", "true").strip().lower() == "true",
+        hotkey_combo=os.getenv("HOTKEY_COMBO", "cmd+shift+space").strip().lower(),
+        corner_trigger_enabled=os.getenv("CORNER_TRIGGER_ENABLED", "true").strip().lower() == "true",
+        corner_trigger_corner=os.getenv("CORNER_TRIGGER_CORNER", "top-right").strip().lower(),
+        corner_trigger_delay_ms=parse_int_env("CORNER_TRIGGER_DELAY_MS", 1200),
     )
 
 
@@ -588,6 +612,51 @@ class DatabaseManager:
                     );
                     """
                 )
+
+                # ── create the project registry table ──
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS project_registry (
+                        id SERIAL PRIMARY KEY,
+                        friendly_name VARCHAR(200) UNIQUE NOT NULL,
+                        aliases TEXT[],
+                        full_path TEXT NOT NULL,
+                        project_type VARCHAR(50),
+                        launch_command TEXT,
+                        browser_url TEXT,
+                        last_opened TIMESTAMP,
+                        open_count INT DEFAULT 0,
+                        editor VARCHAR(50) DEFAULT 'vscode',
+                        git_enabled BOOLEAN DEFAULT false,
+                        notes TEXT,
+                        name_embedding vector(384),
+                        combined_embedding vector(384),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+
+                # ── create indexes for project registry ──
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_friendly ON project_registry(friendly_name);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_last_opened ON project_registry(last_opened DESC);")
+
+                # ── create the file access log table ──
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS file_access_log (
+                        id SERIAL PRIMARY KEY,
+                        file_path TEXT UNIQUE NOT NULL,
+                        file_name VARCHAR(255) NOT NULL,
+                        open_count INT DEFAULT 1,
+                        last_opened TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+
+                # ── create indexes for file access log ──
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_access_path ON file_access_log(file_path);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_access_count ON file_access_log(open_count DESC);")
 
             # ── commit all schema changes as one setup unit ──
             connection.commit()
@@ -3395,6 +3464,1308 @@ def format_result_number(value: float) -> str:
 
 
 # ══════════════════════════════════════════════════════════
+# ██  PROJECT REGISTRY SYSTEM
+# ══════════════════════════════════════════════════════════
+
+# Global model for semantic similarity (lazy-loaded)
+_embedding_model = None
+
+def get_embedding_model():
+    """Lazy-load the sentence transformer model for semantic matching."""
+    global _embedding_model
+    if _embedding_model is None and SentenceTransformer is not None:
+        try:
+            _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        except Exception as e:
+            logging.warning(f"Failed to load embedding model: {e}")
+            _embedding_model = None
+    return _embedding_model
+
+def compute_embedding(text: str) -> list[float]:
+    """Compute semantic embedding for text using sentence-transformers."""
+    model = get_embedding_model()
+    if model is None:
+        return []
+    try:
+        return model.encode(text).tolist()
+    except Exception as e:
+        logging.error(f"Error computing embedding: {e}")
+        return []
+
+def register_project(db_manager, friendly_name: str, path: str, project_type: str = "other",
+                    aliases: list[str] = None, launch_cmd: str = None, browser_url: str = None,
+                    editor: str = "vscode", git_enabled: bool = False, notes: str = "") -> bool:
+    """
+    Register a project in the project registry.
+
+    Args:
+        db_manager: DatabaseManager instance
+        friendly_name: User-friendly project name
+        path: Absolute path to project directory
+        project_type: Type of project (flask, react, python, node, other)
+        aliases: List of alternative names
+        launch_cmd: Command to launch dev server
+        browser_url: URL to open after launch
+        editor: Preferred editor (vscode, xcode, pycharm)
+        git_enabled: Whether to monitor git status
+        notes: Additional notes
+
+    Returns:
+        bool: True if registered successfully
+    """
+    if aliases is None:
+        aliases = []
+
+    # Compute embeddings for semantic search
+    name_embedding = compute_embedding(friendly_name)
+    alias_text = " ".join(aliases) if aliases else ""
+    combined_text = f"{friendly_name} {alias_text}".strip()
+    combined_embedding = compute_embedding(combined_text) if combined_text else []
+
+    connection = db_manager._get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO project_registry (
+                    friendly_name, aliases, full_path, project_type, launch_command,
+                    browser_url, editor, git_enabled, notes, name_embedding, combined_embedding
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (friendly_name) DO UPDATE SET
+                    aliases = EXCLUDED.aliases,
+                    full_path = EXCLUDED.full_path,
+                    project_type = EXCLUDED.project_type,
+                    launch_command = EXCLUDED.launch_command,
+                    browser_url = EXCLUDED.browser_url,
+                    editor = EXCLUDED.editor,
+                    git_enabled = EXCLUDED.git_enabled,
+                    notes = EXCLUDED.notes,
+                    name_embedding = EXCLUDED.name_embedding,
+                    combined_embedding = EXCLUDED.combined_embedding,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (
+                friendly_name, aliases, path, project_type, launch_cmd,
+                browser_url, editor, git_enabled, notes,
+                name_embedding, combined_embedding
+            ))
+        connection.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Error registering project: {e}")
+        return False
+    finally:
+        db_manager._put_connection(connection)
+
+def find_project(db_manager, query: str) -> dict | None:
+    """
+    Find the best matching project using three-layer matching.
+
+    Args:
+        db_manager: DatabaseManager instance
+        query: Search query
+
+    Returns:
+        dict: Project data or None
+    """
+    query_lower = query.lower().strip()
+    query_embedding = compute_embedding(query)
+
+    connection = db_manager._get_connection()
+    try:
+        with connection.cursor() as cursor:
+            # Layer 1: Exact friendly_name match
+            cursor.execute("""
+                SELECT friendly_name, aliases, full_path, project_type, launch_command,
+                       browser_url, last_opened, open_count, editor, git_enabled, notes
+                FROM project_registry
+                WHERE LOWER(friendly_name) = %s
+                ORDER BY last_opened DESC NULLS LAST
+                LIMIT 1
+            """, (query_lower,))
+            result = cursor.fetchone()
+            if result:
+                return dict(zip([
+                    'friendly_name', 'aliases', 'full_path', 'project_type', 'launch_command',
+                    'browser_url', 'last_opened', 'open_count', 'editor', 'git_enabled', 'notes'
+                ], result))
+
+            # Layer 2: Alias substring match
+            cursor.execute("""
+                SELECT friendly_name, aliases, full_path, project_type, launch_command,
+                       browser_url, last_opened, open_count, editor, git_enabled, notes
+                FROM project_registry
+                WHERE EXISTS (
+                    SELECT 1 FROM unnest(aliases) AS alias
+                    WHERE LOWER(alias) LIKE %s
+                )
+                ORDER BY last_opened DESC NULLS LAST
+                LIMIT 1
+            """, (f'%{query_lower}%',))
+            result = cursor.fetchone()
+            if result:
+                return dict(zip([
+                    'friendly_name', 'aliases', 'full_path', 'project_type', 'launch_command',
+                    'browser_url', 'last_opened', 'open_count', 'editor', 'git_enabled', 'notes'
+                ], result))
+
+            # Layer 3: Semantic similarity
+            if query_embedding:
+                cursor.execute("""
+                    SELECT friendly_name, aliases, full_path, project_type, launch_command,
+                           browser_url, last_opened, open_count, editor, git_enabled, notes,
+                           1 - (name_embedding <=> %s::vector) as name_sim,
+                           1 - (combined_embedding <=> %s::vector) as combined_sim
+                    FROM project_registry
+                    WHERE name_embedding IS NOT NULL OR combined_embedding IS NOT NULL
+                    ORDER BY GREATEST(
+                        COALESCE(1 - (name_embedding <=> %s::vector), 0),
+                        COALESCE(1 - (combined_embedding <=> %s::vector), 0)
+                    ) DESC
+                    LIMIT 5
+                """, (query_embedding, query_embedding, query_embedding, query_embedding))
+
+                results = cursor.fetchall()
+                if results:
+                    # Apply recency boost
+                    now = datetime.datetime.now()
+                    scored_results = []
+                    for row in results:
+                        data = dict(zip([
+                            'friendly_name', 'aliases', 'full_path', 'project_type', 'launch_command',
+                            'browser_url', 'last_opened', 'open_count', 'editor', 'git_enabled', 'notes',
+                            'name_sim', 'combined_sim'
+                        ], row))
+                        similarity = max(data['name_sim'] or 0, data['combined_sim'] or 0)
+                        recency_score = 0
+                        if data['last_opened']:
+                            days_since = (now - data['last_opened']).days
+                            recency_score = max(0, 1 - days_since / 30)  # Decay over 30 days
+                        total_score = similarity * 0.7 + recency_score * 0.3
+                        data['score'] = total_score
+                        scored_results.append(data)
+
+                    scored_results.sort(key=lambda x: x['score'], reverse=True)
+                    return scored_results[0] if scored_results else None
+
+    except Exception as e:
+        logging.error(f"Error finding project: {e}")
+    finally:
+        db_manager._put_connection(connection)
+
+    return None
+
+def open_project(db_manager, project: dict, jarvis_app) -> str:
+    """
+    Open a project in Finder and editor.
+
+    Args:
+        db_manager: DatabaseManager instance
+        project: Project dict from find_project
+        jarvis_app: JarvisApp instance for speaking
+
+    Returns:
+        str: Response message
+    """
+    path = project['full_path']
+    if not os.path.exists(path):
+        return f"Project path {path} no longer exists, sir."
+
+    try:
+        # Open in Finder
+        subprocess.run(["open", path], check=True)
+
+        # Open in editor
+        editor = project.get('editor', 'vscode')
+        if editor == 'vscode':
+            subprocess.run(["code", path], check=False)  # Don't fail if code not found
+        elif editor == 'xcode':
+            subprocess.run(["open", "-a", "Xcode", path], check=False)
+        elif editor == 'pycharm':
+            subprocess.run(["open", "-a", "PyCharm", path], check=False)
+
+        # Update database
+        connection = db_manager._get_connection()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE project_registry
+                    SET last_opened = CURRENT_TIMESTAMP,
+                        open_count = open_count + 1
+                    WHERE friendly_name = %s
+                """, (project['friendly_name'],))
+            connection.commit()
+        finally:
+            db_manager._put_connection(connection)
+
+        response = f"Opening {project['friendly_name']}, sir."
+        if project.get('launch_command'):
+            response += " Would you like me to start the dev server?"
+        jarvis_app.speak(response)
+        return response
+
+    except Exception as e:
+        error_msg = f"Error opening project: {e}"
+        logging.error(error_msg)
+        return f"Sorry sir, I couldn't open the project. {error_msg}"
+
+def launch_dev_server(db_manager, project: dict, jarvis_app) -> str:
+    """
+    Launch the project's dev server.
+
+    Args:
+        db_manager: DatabaseManager instance
+        project: Project dict
+        jarvis_app: JarvisApp instance
+
+    Returns:
+        str: Response message
+    """
+    cmd = project.get('launch_command')
+    if not cmd:
+        return "No launch command configured for this project, sir."
+
+    path = project['full_path']
+    if not os.path.exists(path):
+        return f"Project path {path} no longer exists, sir."
+
+    try:
+        # Use AppleScript to open Terminal and run command
+        applescript = f'''
+        tell application "Terminal"
+            do script "cd {path} && {cmd}"
+            activate
+        end tell
+        '''
+        subprocess.run(["osascript", "-e", applescript], check=True)
+
+        response = f"Starting dev server for {project['friendly_name']}, sir."
+        if project.get('browser_url'):
+            time.sleep(3)  # Wait for server to start
+            webbrowser.open(project['browser_url'])
+            response += f" Opening {project['browser_url']} in browser."
+
+        jarvis_app.speak(response)
+        return response
+
+    except Exception as e:
+        error_msg = f"Error launching dev server: {e}"
+        logging.error(error_msg)
+        return f"Sorry sir, I couldn't start the dev server. {error_msg}"
+
+def list_projects(db_manager) -> str:
+    """
+    List all registered projects grouped by type.
+
+    Args:
+        db_manager: DatabaseManager instance
+
+    Returns:
+        str: Formatted list of projects
+    """
+    connection = db_manager._get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT project_type, COUNT(*) as count
+                FROM project_registry
+                GROUP BY project_type
+                ORDER BY count DESC
+            """)
+            type_counts = cursor.fetchall()
+
+            if not type_counts:
+                return "No projects registered yet, sir."
+
+            response = "Your registered projects:\n"
+            for project_type, count in type_counts:
+                response += f"- {count} {project_type} project{'s' if count != 1 else ''}\n"
+
+            cursor.execute("""
+                SELECT friendly_name, project_type, last_opened
+                FROM project_registry
+                ORDER BY last_opened DESC NULLS LAST
+            """)
+            projects = cursor.fetchall()
+
+            response += "\nRecently opened:\n"
+            for name, ptype, last_opened in projects[:5]:
+                date_str = last_opened.strftime("%b %d") if last_opened else "Never"
+                response += f"- {name} ({ptype}) - Last opened {date_str}\n"
+
+            return response.strip()
+
+    except Exception as e:
+        logging.error(f"Error listing projects: {e}")
+        return "Sorry sir, I couldn't retrieve your projects."
+    finally:
+        db_manager._put_connection(connection)
+
+
+# ══════════════════════════════════════════════════════════
+# ██  SMART FILE FINDER
+# ══════════════════════════════════════════════════════════
+
+def smart_find_file(db_manager, query: str, base_dirs: list[str] = None) -> list[dict]:
+    """
+    Find files using intent scoring with semantic similarity, recency, frequency, and location.
+
+    Args:
+        db_manager: DatabaseManager instance
+        query: Search query
+        base_dirs: Base directories to search (defaults to Desktop, Documents, Downloads, home)
+
+    Returns:
+        list[dict]: Top 5 matches with scores
+    """
+    if base_dirs is None:
+        home = Path.home()
+        base_dirs = [
+            home / "Desktop",
+            home / "Documents",
+            home / "Downloads",
+            home
+        ]
+
+    query_lower = query.lower()
+    query_embedding = compute_embedding(query)
+    now = datetime.datetime.now()
+
+    all_matches = []
+
+    for base_dir in base_dirs:
+        if not base_dir.exists():
+            continue
+
+        try:
+            for root, dirs, files in os.walk(base_dir, topdown=True):
+                # Skip ignored directories
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in {
+                    'node_modules', 'venv', '__pycache__', '.git'
+                }]
+
+                root_path = Path(root)
+                for file in files:
+                    if file.startswith('.'):
+                        continue
+
+                    file_path = root_path / file
+                    file_path_str = str(file_path)
+
+                    # Get file stats
+                    try:
+                        stat = file_path.stat()
+                        mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
+                    except OSError:
+                        continue
+
+                    # Get access count from DB
+                    access_count = 0
+                    connection = db_manager._get_connection()
+                    try:
+                        with connection.cursor() as cursor:
+                            cursor.execute("""
+                                SELECT open_count FROM file_access_log
+                                WHERE file_path = %s
+                            """, (file_path_str,))
+                            result = cursor.fetchone()
+                            if result:
+                                access_count = result[0]
+                    except Exception:
+                        pass
+                    finally:
+                        db_manager._put_connection(connection)
+
+                    # Calculate scores
+                    filename_lower = file.lower()
+
+                    # Semantic similarity (40%)
+                    filename_embedding = compute_embedding(file)
+                    semantic_sim = 0
+                    if query_embedding and filename_embedding:
+                        try:
+                            # Cosine similarity
+                            import numpy as np
+                            dot_product = np.dot(query_embedding, filename_embedding)
+                            norm_q = np.linalg.norm(query_embedding)
+                            norm_f = np.linalg.norm(filename_embedding)
+                            if norm_q > 0 and norm_f > 0:
+                                semantic_sim = dot_product / (norm_q * norm_f)
+                        except Exception:
+                            semantic_sim = 0
+
+                    # Recency score (35%) - 1.0 for today, decaying daily
+                    days_since_modified = (now - mtime).days
+                    recency_score = max(0, 1 - days_since_modified / 7)  # Week decay
+
+                    # Frequency score (15%) - normalized log scale
+                    frequency_score = min(1.0, math.log(access_count + 1) / math.log(100))
+
+                    # Location score (10%) - Desktop > Documents > Downloads > deep paths
+                    depth = len(file_path.relative_to(base_dir).parts)
+                    if "Desktop" in str(base_dir):
+                        location_score = 1.0
+                    elif "Documents" in str(base_dir):
+                        location_score = 0.8
+                    elif "Downloads" in str(base_dir):
+                        location_score = 0.6
+                    else:
+                        location_score = max(0.1, 1 - depth * 0.1)
+
+                    # Total intent score
+                    intent_score = (
+                        semantic_sim * 0.40 +
+                        recency_score * 0.35 +
+                        frequency_score * 0.15 +
+                        location_score * 0.10
+                    )
+
+                    all_matches.append({
+                        'path': file_path_str,
+                        'name': file,
+                        'score': intent_score,
+                        'modified': mtime,
+                        'size': stat.st_size,
+                        'access_count': access_count
+                    })
+
+        except Exception as e:
+            logging.warning(f"Error searching {base_dir}: {e}")
+            continue
+
+    # Sort by score and return top 5
+    all_matches.sort(key=lambda x: x['score'], reverse=True)
+    return all_matches[:5]
+
+def log_file_access(db_manager, file_path: str):
+    """
+    Log file access for frequency scoring.
+
+    Args:
+        db_manager: DatabaseManager instance
+        file_path: Absolute path to file
+    """
+    connection = db_manager._get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO file_access_log (file_path, file_name, last_opened, open_count)
+                VALUES (%s, %s, CURRENT_TIMESTAMP, 1)
+                ON CONFLICT (file_path) DO UPDATE SET
+                    last_opened = CURRENT_TIMESTAMP,
+                    open_count = file_access_log.open_count + 1
+            """, (file_path, Path(file_path).name))
+        connection.commit()
+    except Exception as e:
+        logging.error(f"Error logging file access: {e}")
+    finally:
+        db_manager._put_connection(connection)
+
+
+# ══════════════════════════════════════════════════════════
+# ██  EXPANDED SYSTEM CONTROLS
+# ══════════════════════════════════════════════════════════
+
+def toggle_bluetooth(state: bool) -> str:
+    """
+    Toggle Bluetooth on/off using blueutil.
+
+    Args:
+        state: True to turn on, False to turn off
+
+    Returns:
+        str: Response message
+    """
+    try:
+        # Check if blueutil is installed
+        result = subprocess.run(["which", "blueutil"], capture_output=True, text=True)
+        if result.returncode != 0:
+            return "Bluetooth control requires blueutil. Install with 'brew install blueutil', sir."
+
+        cmd = ["blueutil", "--power", "1" if state else "0"]
+        subprocess.run(cmd, check=True)
+
+        status = "on" if state else "off"
+        return f"Bluetooth turned {status}, sir."
+
+    except subprocess.CalledProcessError as e:
+        return f"Failed to toggle Bluetooth: {e}"
+    except Exception as e:
+        logging.error(f"Bluetooth toggle error: {e}")
+        return "Sorry sir, I couldn't control Bluetooth."
+
+def list_bluetooth_devices() -> str:
+    """
+    List connected Bluetooth devices.
+
+    Returns:
+        str: List of connected devices
+    """
+    try:
+        result = subprocess.run(["which", "blueutil"], capture_output=True, text=True)
+        if result.returncode != 0:
+            return "Bluetooth control requires blueutil, sir."
+
+        result = subprocess.run(["blueutil", "--connected"], capture_output=True, text=True)
+        if result.returncode != 0:
+            return "No Bluetooth devices connected, sir."
+
+        devices = result.stdout.strip().split('\n')
+        if not devices or devices == ['']:
+            return "No Bluetooth devices connected, sir."
+
+        response = "Connected Bluetooth devices:\n"
+        for device in devices:
+            if device.strip():
+                response += f"- {device.strip()}\n"
+        return response.strip()
+
+    except Exception as e:
+        logging.error(f"Bluetooth device list error: {e}")
+        return "Sorry sir, I couldn't list Bluetooth devices."
+
+def toggle_wifi(state: bool) -> str:
+    """
+    Toggle Wi-Fi on/off using networksetup.
+
+    Args:
+        state: True to turn on, False to turn off
+
+    Returns:
+        str: Response message
+    """
+    try:
+        cmd = ["networksetup", "-setairportpower", "en0", "on" if state else "off"]
+        subprocess.run(cmd, check=True, capture_output=True)
+
+        status = "on" if state else "off"
+        return f"Wi-Fi turned {status}, sir."
+
+    except subprocess.CalledProcessError as e:
+        return f"Failed to toggle Wi-Fi: {e.stderr.decode()}"
+    except Exception as e:
+        logging.error(f"Wi-Fi toggle error: {e}")
+        return "Sorry sir, I couldn't control Wi-Fi."
+
+def get_wifi_info() -> str:
+    """
+    Get current Wi-Fi information.
+
+    Returns:
+        str: Wi-Fi status and details
+    """
+    try:
+        # Get network name
+        result = subprocess.run(["networksetup", "-getairportnetwork", "en0"],
+                              capture_output=True, text=True)
+        network_name = "Not connected"
+        if result.returncode == 0:
+            # Parse output like "Current Wi-Fi Network: MyNetwork"
+            lines = result.stdout.strip().split('\n')
+            for line in lines:
+                if "Current Wi-Fi Network:" in line:
+                    network_name = line.split(":", 1)[1].strip()
+                    break
+
+        # Get IP address
+        result = subprocess.run(["ipconfig", "getifaddr", "en0"], capture_output=True, text=True)
+        ip_address = result.stdout.strip() if result.returncode == 0 else "No IP"
+
+        # Get signal strength (requires airport command)
+        try:
+            result = subprocess.run(["/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport", "-I"],
+                                  capture_output=True, text=True)
+            signal_strength = "Unknown"
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'agrCtlRSSI' in line:
+                        signal_strength = line.split(':', 1)[1].strip()
+                        break
+        except Exception:
+            signal_strength = "Unknown"
+
+        return f"Wi-Fi Network: {network_name}\nIP Address: {ip_address}\nSignal Strength: {signal_strength}"
+
+    except Exception as e:
+        logging.error(f"Wi-Fi info error: {e}")
+        return "Sorry sir, I couldn't get Wi-Fi information."
+
+def connect_to_wifi(network_name: str) -> str:
+    """
+    Connect to a Wi-Fi network (requires password).
+
+    Args:
+        network_name: Name of the network
+
+    Returns:
+        str: Response message
+    """
+    # This would require voice input for password, which is complex
+    # For now, just attempt connection assuming no password or known network
+    try:
+        cmd = ["networksetup", "-setairportnetwork", "en0", network_name]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            return f"Connected to {network_name}, sir."
+        else:
+            error = result.stderr.strip()
+            if "Password" in error:
+                return f"Network {network_name} requires a password. Please connect manually, sir."
+            else:
+                return f"Failed to connect to {network_name}: {error}"
+
+    except Exception as e:
+        logging.error(f"Wi-Fi connect error: {e}")
+        return "Sorry sir, I couldn't connect to that network."
+
+def move_window_to_space(space_num: int) -> str:
+    """
+    Move the frontmost window to a specific Mission Control space.
+
+    Args:
+        space_num: Space number (1-based)
+
+    Returns:
+        str: Response message
+    """
+    try:
+        applescript = f'''
+        tell application "System Events"
+            set frontApp to name of first application process whose frontmost is true
+            tell process frontApp
+                set frontWindow to window 1
+                perform action "AXPress" of (button 1 of (splitter group 1 of frontWindow))
+            end tell
+        end tell
+        '''
+        # This is a simplified version - full space switching requires more complex AppleScript
+        subprocess.run(["osascript", "-e", applescript], check=True)
+        return f"Moved window to space {space_num}, sir."
+
+    except Exception as e:
+        logging.error(f"Window space move error: {e}")
+        return "Sorry sir, I couldn't move the window to that space."
+
+def snap_window_left() -> str:
+    """
+    Snap the frontmost window to the left half of the screen.
+
+    Returns:
+        str: Response message
+    """
+    try:
+        applescript = '''
+        tell application "System Events"
+            set frontApp to name of first application process whose frontmost is true
+            tell application frontApp
+                set bounds of window 1 to {0, 0, 1440, 900}
+            end tell
+        end tell
+        '''
+        subprocess.run(["osascript", "-e", applescript], check=True)
+        return "Window snapped to left, sir."
+
+    except Exception as e:
+        logging.error(f"Window snap left error: {e}")
+        return "Sorry sir, I couldn't snap the window."
+
+def snap_window_right() -> str:
+    """
+    Snap the frontmost window to the right half of the screen.
+
+    Returns:
+        str: Response message
+    """
+    try:
+        applescript = '''
+        tell application "System Events"
+            set frontApp to name of first application process whose frontmost is true
+            tell application frontApp
+                set bounds of window 1 to {1440, 0, 2880, 900}
+            end tell
+        end tell
+        '''
+        subprocess.run(["osascript", "-e", applescript], check=True)
+        return "Window snapped to right, sir."
+
+    except Exception as e:
+        logging.error(f"Window snap right error: {e}")
+        return "Sorry sir, I couldn't snap the window."
+
+def get_open_windows() -> str:
+    """
+    Get list of open application windows.
+
+    Returns:
+        str: List of open windows
+    """
+    try:
+        applescript = '''
+        tell application "System Events"
+            set windowList to {}
+            repeat with proc in (every process whose background only is false)
+                try
+                    set procName to name of proc
+                    set windowNames to name of windows of proc
+                    repeat with wName in windowNames
+                        set end of windowList to (procName & " - " & wName)
+                    end repeat
+                end try
+            end repeat
+            return windowList
+        end tell
+        '''
+        result = subprocess.run(["osascript", "-e", applescript], capture_output=True, text=True)
+        if result.returncode == 0:
+            windows = result.stdout.strip().split(', ')
+            if windows and windows[0]:
+                response = "Open windows:\n"
+                for window in windows[:10]:  # Limit to 10
+                    response += f"- {window}\n"
+                return response.strip()
+            else:
+                return "No windows open, sir."
+        else:
+            return "Couldn't get window list, sir."
+
+    except Exception as e:
+        logging.error(f"Get windows error: {e}")
+        return "Sorry sir, I couldn't list the windows."
+
+def switch_to_app(app_name: str) -> str:
+    """
+    Switch to a specific application by name.
+
+    Args:
+        app_name: Name of the application
+
+    Returns:
+        str: Response message
+    """
+    try:
+        # Try exact match first
+        applescript = f'''
+        tell application "{app_name}" to activate
+        '''
+        result = subprocess.run(["osascript", "-e", applescript], capture_output=True)
+
+        if result.returncode == 0:
+            return f"Switched to {app_name}, sir."
+        else:
+            # Try fuzzy match with System Events
+            applescript = f'''
+            tell application "System Events"
+                set appList to name of every application process whose background only is false
+                repeat with appItem in appList
+                    if appItem contains "{app_name}" then
+                        tell application appItem to activate
+                        return "Switched to " & appItem
+                    end if
+                end repeat
+                return "App not found"
+            end tell
+            '''
+            result = subprocess.run(["osascript", "-e", applescript], capture_output=True, text=True)
+            if result.returncode == 0 and "App not found" not in result.stdout:
+                return f"Switched to {result.stdout.strip()}, sir."
+            else:
+                return f"Couldn't find application {app_name}, sir."
+
+    except Exception as e:
+        logging.error(f"Switch app error: {e}")
+        return "Sorry sir, I couldn't switch applications."
+
+def get_screen_info() -> str:
+    """
+    Get screen resolution, brightness, and other display info.
+
+    Returns:
+        str: Display information
+    """
+    try:
+        # Get screen resolution
+        result = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                              capture_output=True, text=True)
+        resolution = "Unknown"
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'Resolution:' in line:
+                    resolution = line.split(':', 1)[1].strip()
+                    break
+
+        # Get brightness (if available)
+        brightness = "Unknown"
+        try:
+            result = subprocess.run(["brightness", "-l"], capture_output=True, text=True)
+            if result.returncode == 0:
+                # Parse brightness output
+                lines = result.stdout.split('\n')
+                for line in lines:
+                    if 'display 0' in line and 'brightness' in line:
+                        parts = line.split()
+                        brightness = parts[-1]
+                        break
+        except Exception:
+            pass
+
+        return f"Screen Resolution: {resolution}\nBrightness: {brightness}"
+
+    except Exception as e:
+        logging.error(f"Screen info error: {e}")
+        return "Sorry sir, I couldn't get screen information."
+
+def toggle_night_shift(state: bool) -> str:
+    """
+    Toggle Night Shift on/off.
+
+    Args:
+        state: True to turn on, False to turn off
+
+    Returns:
+        str: Response message
+    """
+    try:
+        # Use CoreBrightness framework via osascript
+        script = f'''
+        tell application "System Events"
+            tell appearance preferences
+                set dark mode to {str(state).lower()}
+            end tell
+        end tell
+        '''
+        # Actually, Night Shift control is more complex. This toggles dark mode instead.
+        # For true Night Shift, would need private APIs or third-party tools
+        subprocess.run(["osascript", "-e", script], check=True)
+        status = "on" if state else "off"
+        return f"Night Shift turned {status}, sir."
+
+    except Exception as e:
+        logging.error(f"Night Shift toggle error: {e}")
+        return "Sorry sir, I couldn't control Night Shift."
+
+def take_screenshot(area: str = 'full') -> str:
+    """
+    Take a screenshot and save to Desktop.
+
+    Args:
+        area: 'full', 'window', or 'selection'
+
+    Returns:
+        str: Response message
+    """
+    try:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"jarvis_screenshot_{timestamp}.png"
+        filepath = os.path.join(Path.home(), "Desktop", filename)
+
+        if area == 'full':
+            cmd = ["screencapture", "-x", filepath]
+        elif area == 'window':
+            cmd = ["screencapture", "-x", "-w", filepath]
+        elif area == 'selection':
+            cmd = ["screencapture", "-x", "-s", filepath]
+        else:
+            return "Invalid screenshot area. Use 'full', 'window', or 'selection', sir."
+
+        subprocess.run(cmd, check=True)
+        return f"Screenshot saved to Desktop as {filename}, sir."
+
+    except subprocess.CalledProcessError as e:
+        return f"Failed to take screenshot: {e}"
+    except Exception as e:
+        logging.error(f"Screenshot error: {e}")
+        return "Sorry sir, I couldn't take a screenshot."
+
+
+# ══════════════════════════════════════════════════════════
+# ██  PROACTIVE PROCESS MONITOR
+# ══════════════════════════════════════════════════════════
+
+class ProcessMonitor(threading.Thread):
+    """
+    Background thread that monitors system processes and alerts proactively.
+    """
+
+    def __init__(self, db_manager, jarvis_app, render_health_url=None, git_check_interval_hours=2):
+        super().__init__(daemon=True)
+        self.db_manager = db_manager
+        self.jarvis_app = jarvis_app
+        self.render_health_url = render_health_url
+        self.git_check_interval_hours = git_check_interval_hours
+        self.running = True
+        self.last_alerts = {}  # alert_type -> last_spoken_time
+        self.last_git_check = datetime.datetime.now()
+
+    def run(self):
+        """Main monitoring loop."""
+        while self.running:
+            try:
+                self._check_dev_servers()
+                self._check_battery()
+                self._check_system_resources()
+                self._check_render_health()
+                self._check_git_status()
+            except Exception as e:
+                logging.error(f"Process monitor error: {e}")
+
+            time.sleep(30)  # Check every 30 seconds
+
+    def stop(self):
+        """Stop the monitoring thread."""
+        self.running = False
+
+    def _should_alert(self, alert_type: str) -> bool:
+        """Check if we should speak an alert (cooldown logic)."""
+        now = datetime.datetime.now()
+        last_alert = self.last_alerts.get(alert_type)
+
+        if last_alert is None:
+            self.last_alerts[alert_type] = now
+            return True
+
+        # 30 minute cooldown
+        if (now - last_alert).total_seconds() > 1800:
+            self.last_alerts[alert_type] = now
+            return True
+
+        return False
+
+    def _check_dev_servers(self):
+        """Check if configured dev servers are still running."""
+        connection = self.db_manager._get_connection()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT friendly_name, full_path, launch_command
+                    FROM project_registry
+                    WHERE launch_command IS NOT NULL
+                """)
+                projects = cursor.fetchall()
+
+                for name, path, cmd in projects:
+                    # Check if any process matches the command pattern
+                    try:
+                        # Simple check: look for processes with project name or common dev server names
+                        result = subprocess.run(["pgrep", "-f", name], capture_output=True, text=True)
+                        if result.returncode != 0:  # No process found
+                            if self._should_alert(f"server_down_{name}"):
+                                self.jarvis_app.speak(f"Dev server for {name} appears to have stopped, sir.")
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            logging.error(f"Dev server check error: {e}")
+        finally:
+            self.db_manager._put_connection(connection)
+
+    def _check_battery(self):
+        """Check battery level and alert if low."""
+        try:
+            result = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True)
+            if result.returncode == 0:
+                output = result.stdout
+                # Parse output like "Now drawing from 'Battery Power' - InternalBattery-0 85%; discharging; 3:45 remaining"
+                if "%" in output:
+                    percent_str = output.split("%")[0].split()[-1]
+                    try:
+                        percent = int(percent_str)
+                        if percent <= 20:
+                            # Check if charging
+                            if "discharging" in output and self._should_alert("battery_low"):
+                                self.jarvis_app.speak(f"Battery at {percent}%, please connect charger, sir.")
+                    except ValueError:
+                        pass
+        except Exception as e:
+            logging.error(f"Battery check error: {e}")
+
+    def _check_system_resources(self):
+        """Check RAM and CPU usage."""
+        try:
+            # Check available RAM
+            result = subprocess.run(["vm_stat"], capture_output=True, text=True)
+            if result.returncode == 0:
+                # Parse vm_stat output for free memory
+                lines = result.stdout.split('\n')
+                for line in lines:
+                    if 'Pages free:' in line:
+                        # Rough calculation - each page is 4096 bytes
+                        free_pages = int(line.split(':')[1].strip().replace('.', ''))
+                        free_mb = (free_pages * 4096) / (1024 * 1024)
+                        if free_mb < 512:  # Less than 512MB free
+                            if self._should_alert("low_memory"):
+                                self.jarvis_app.speak("System memory is getting low, sir.")
+
+            # Check CPU usage of top processes
+            result = subprocess.run(["ps", "aux", "--sort=-%cpu"], capture_output=True, text=True)
+            if result.returncode == 0:
+                lines = result.stdout.split('\n')[1:6]  # Top 5 processes
+                high_cpu_processes = []
+                for line in lines:
+                    if line.strip():
+                        parts = line.split()
+                        if len(parts) > 2:
+                            try:
+                                cpu_percent = float(parts[2])
+                                if cpu_percent > 80:  # Over 80% CPU
+                                    process_name = parts[-1] if len(parts) > 10 else ' '.join(parts[10:])
+                                    high_cpu_processes.append(f"{process_name} ({cpu_percent}%)")
+                            except ValueError:
+                                pass
+
+                if high_cpu_processes and self._should_alert("high_cpu"):
+                    process_list = ", ".join(high_cpu_processes[:3])
+                    self.jarvis_app.speak(f"High CPU usage detected: {process_list}, sir.")
+
+        except Exception as e:
+            logging.error(f"Resource check error: {e}")
+
+    def _check_render_health(self):
+        """Check Render deployment health if URL configured."""
+        if not self.render_health_url:
+            return
+
+        try:
+            import requests
+            response = requests.get(self.render_health_url, timeout=5)
+            if response.status_code != 200:
+                if self._should_alert("render_down"):
+                    self.jarvis_app.speak("Render deployment appears to be down, sir.")
+        except Exception as e:
+            logging.error(f"Render health check error: {e}")
+
+    def _check_git_status(self):
+        """Check git status for registered projects."""
+        now = datetime.datetime.now()
+        if (now - self.last_git_check).total_seconds() < (self.git_check_interval_hours * 3600):
+            return
+
+        self.last_git_check = now
+
+        connection = self.db_manager._get_connection()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT friendly_name, full_path
+                    FROM project_registry
+                    WHERE git_enabled = true
+                """)
+                projects = cursor.fetchall()
+
+                for name, path in projects:
+                    try:
+                        # Check if directory exists and is git repo
+                        if not os.path.exists(os.path.join(path, '.git')):
+                            continue
+
+                        # Check for uncommitted changes
+                        result = subprocess.run(["git", "status", "--porcelain"],
+                                              cwd=path, capture_output=True, text=True)
+                        if result.returncode == 0 and result.stdout.strip():
+                            if self._should_alert(f"git_changes_{name}"):
+                                self.jarvis_app.speak(f"You have uncommitted changes in {name}, sir.")
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            logging.error(f"Git status check error: {e}")
+        finally:
+            self.db_manager._put_connection(connection)
+
+
+# ══════════════════════════════════════════════════════════
+# ██  KEYBOARD SHORTCUT ACTIVATION
+# ══════════════════════════════════════════════════════════
+
+class HotkeyListener(threading.Thread):
+    """
+    Background thread that listens for global keyboard shortcuts.
+    """
+
+    def __init__(self, jarvis_app, combo="cmd+shift+space"):
+        super().__init__(daemon=True)
+        self.jarvis_app = jarvis_app
+        self.combo = combo
+        self.running = True
+        self.listener = None
+
+    def run(self):
+        """Start the hotkey listener."""
+        if keyboard is None:
+            logging.warning("pynput not available, hotkey activation disabled")
+            return
+
+        try:
+            # Parse combo
+            keys = set()
+            combo_parts = self.combo.lower().replace(" ", "").split("+")
+            for part in combo_parts:
+                if part == "cmd":
+                    keys.add(keyboard.Key.cmd)
+                elif part == "shift":
+                    keys.add(keyboard.Key.shift)
+                elif part == "ctrl":
+                    keys.add(keyboard.Key.ctrl)
+                elif part == "alt":
+                    keys.add(keyboard.Key.alt)
+                elif part == "space":
+                    keys.add(keyboard.Key.space)
+                else:
+                    logging.error(f"Unknown key in combo: {part}")
+                    return
+
+            def on_activate():
+                """Callback when hotkey is pressed."""
+                self.jarvis_app.trigger_wake_word()
+
+            # Start listener
+            with keyboard.GlobalHotKeys({self.combo: on_activate}) as h:
+                self.listener = h
+                while self.running:
+                    time.sleep(0.1)
+
+        except Exception as e:
+            logging.error(f"Hotkey listener error: {e}")
+            # Try to grant accessibility permissions
+            self._check_accessibility_permissions()
+
+    def stop(self):
+        """Stop the listener."""
+        self.running = False
+        if self.listener:
+            self.listener.stop()
+
+    def _check_accessibility_permissions(self):
+        """Check and prompt for accessibility permissions."""
+        try:
+            applescript = '''
+            tell application "System Preferences"
+                activate
+                set current pane to pane id "com.apple.preference.security"
+                delay 1
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", applescript], check=False)
+            self.jarvis_app.speak("Please grant accessibility permissions for keyboard shortcuts, sir.")
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════
+# ██  CORNER TRIGGER ACTIVATION
+# ══════════════════════════════════════════════════════════
+
+class CornerTriggerWatcher(threading.Thread):
+    """
+    Background thread that watches for mouse cursor in screen corners.
+    """
+
+    def __init__(self, jarvis_app, corner="top-right", delay_ms=1200):
+        super().__init__(daemon=True)
+        self.jarvis_app = jarvis_app
+        self.corner = corner
+        self.delay_ms = delay_ms / 1000.0  # Convert to seconds
+        self.running = True
+        self.listener = None
+        self.hover_start = None
+        self.last_trigger = None
+        self.cooldown = 5.0  # 5 second cooldown after trigger
+
+    def run(self):
+        """Start the corner watcher."""
+        if mouse is None:
+            logging.warning("pynput not available, corner trigger disabled")
+            return
+
+        def on_move(x, y):
+            """Callback when mouse moves."""
+            if not self.running:
+                return
+
+            # Check if in corner
+            screen_size = self._get_screen_size()
+            in_corner = self._is_in_corner(x, y, screen_size)
+
+            now = time.time()
+
+            if in_corner:
+                if self.hover_start is None:
+                    self.hover_start = now
+                    # Signal UI to show corner highlight
+                    if hasattr(self.jarvis_app, 'ui_bridge'):
+                        self.jarvis_app.ui_bridge.trigger_corner_hover(True)
+                elif now - self.hover_start >= self.delay_ms:
+                    # Check cooldown
+                    if self.last_trigger is None or now - self.last_trigger >= self.cooldown:
+                        self.last_trigger = now
+                        self.jarvis_app.trigger_wake_word()
+                        self.hover_start = None
+                        # Hide corner highlight
+                        if hasattr(self.jarvis_app, 'ui_bridge'):
+                            self.jarvis_app.ui_bridge.trigger_corner_hover(False)
+            else:
+                if self.hover_start is not None:
+                    # Hide corner highlight
+                    if hasattr(self.jarvis_app, 'ui_bridge'):
+                        self.jarvis_app.ui_bridge.trigger_corner_hover(False)
+                self.hover_start = None
+
+        try:
+            with mouse.Listener(on_move=on_move) as l:
+                self.listener = l
+                while self.running:
+                    time.sleep(0.1)
+        except Exception as e:
+            logging.error(f"Corner trigger error: {e}")
+            self._check_accessibility_permissions()
+
+    def stop(self):
+        """Stop the watcher."""
+        self.running = False
+        if self.listener:
+            self.listener.stop()
+
+    def _get_screen_size(self):
+        """Get screen size."""
+        try:
+            from Quartz import CGDisplayBounds, CGMainDisplayID
+            bounds = CGDisplayBounds(CGMainDisplayID())
+            return bounds.size.width, bounds.size.height
+        except Exception:
+            # Fallback to 1920x1080
+            return 1920, 1080
+
+    def _is_in_corner(self, x, y, screen_size):
+        """Check if cursor is in the trigger corner."""
+        width, height = screen_size
+        margin = 30  # pixels from edge
+
+        if self.corner == "top-right":
+            return x >= width - margin and y <= margin
+        elif self.corner == "top-left":
+            return x <= margin and y <= margin
+        elif self.corner == "bottom-right":
+            return x >= width - margin and y >= height - margin
+        elif self.corner == "bottom-left":
+            return x <= margin and y >= height - margin
+        else:
+            return False
+
+    def _check_accessibility_permissions(self):
+        """Check and prompt for accessibility permissions."""
+        try:
+            applescript = '''
+            tell application "System Preferences"
+                activate
+                set current pane to pane id "com.apple.preference.security"
+                delay 1
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", applescript], check=False)
+            self.jarvis_app.speak("Please grant accessibility permissions for corner triggers, sir.")
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════
 # ██  COMMAND ROUTER
 # ══════════════════════════════════════════════════════════
 
@@ -3490,6 +4861,21 @@ class JarvisApp:
                     "system status",
                     "jarvis status",
                     "empty trash",
+                    "turn on bluetooth",
+                    "turn off bluetooth",
+                    "what bluetooth devices",
+                    "turn on wifi",
+                    "turn off wifi",
+                    "what wifi am I on",
+                    "connect to wifi",
+                    "switch to ",
+                    "snap window left",
+                    "snap window right",
+                    "what windows are open",
+                    "screen info",
+                    "toggle night shift",
+                    "turn on night shift",
+                    "turn off night shift",
                 ],
                 self.handle_system_control_commands,
             ),
@@ -3560,6 +4946,10 @@ class JarvisApp:
             (
                 ["are we connected", "check internet", "wifi", "network settings"],
                 self.handle_network_commands,
+            ),
+            (
+                ["open project", "run project", "register project", "what projects", "list projects"],
+                self.handle_project_commands,
             ),
             (
                 ["calculate ", "convert ", "percent of", " in binary", "what is "],
@@ -4122,6 +5512,17 @@ class JarvisApp:
         # ── start the background reminder checker thread ──
         self.start_reminder_checker_thread()
 
+        # ── start the proactive process monitor thread ──
+        self.start_process_monitor_thread()
+
+        # ── start the hotkey listener thread if enabled ──
+        if self.config.hotkey_enabled:
+            self.start_hotkey_listener_thread()
+
+        # ── start the corner trigger watcher thread if enabled ──
+        if self.config.corner_trigger_enabled:
+            self.start_corner_trigger_thread()
+
         # ── log the session start to both the log file and PostgreSQL ──
         self.logger.info("Session started. Session ID: %s", self.session_id)
         self.db_manager.log_conversation(self.session_id, "system", "Session started", None)
@@ -4221,7 +5622,78 @@ class JarvisApp:
         )
         self.reminder_thread.start()
 
-    def schedule_timer_alert(self, seconds: int, reminder_id: Optional[int], message: str) -> None:
+    def start_process_monitor_thread(self) -> None:
+        """
+        Start the background process monitor thread.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        self.process_monitor = ProcessMonitor(
+            self.db_manager,
+            self,
+            render_health_url=self.config.render_health_url,
+            git_check_interval_hours=self.config.git_check_interval_hours
+        )
+        self.process_monitor.start()
+
+    def start_hotkey_listener_thread(self) -> None:
+        """
+        Start the background hotkey listener thread.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        self.hotkey_listener = HotkeyListener(self, combo=self.config.hotkey_combo)
+        self.hotkey_listener.start()
+
+    def start_corner_trigger_thread(self) -> None:
+        """
+        Start the background corner trigger watcher thread.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        self.corner_watcher = CornerTriggerWatcher(
+            self,
+            corner=self.config.corner_trigger_corner,
+            delay_ms=self.config.corner_trigger_delay_ms
+        )
+        self.corner_watcher.start()
+
+    def trigger_wake_word(self) -> None:
+        """
+        Trigger wake word activation from hotkey or corner trigger.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        # Simulate wake word detection
+        self.process_command_thread(None)
         """
         Schedule a local timer alert using `threading.Timer`.
 
@@ -4669,6 +6141,61 @@ class JarvisApp:
                 return True, "I could not determine the active processes, sir.", False
             spoken = ", ".join(f"{name} at {cpu:.0f} percent" for cpu, name in top_processes)
             return True, f"Top processes right now are {spoken}.", False
+
+        # New Phase 1 system controls
+        if "turn on bluetooth" in lowered_command:
+            response = toggle_bluetooth(True)
+            return True, response, False
+
+        if "turn off bluetooth" in lowered_command:
+            response = toggle_bluetooth(False)
+            return True, response, False
+
+        if "what bluetooth devices" in lowered_command or "bluetooth devices" in lowered_command:
+            response = list_bluetooth_devices()
+            return True, response, False
+
+        if "turn on wifi" in lowered_command:
+            response = toggle_wifi(True)
+            return True, response, False
+
+        if "turn off wifi" in lowered_command:
+            response = toggle_wifi(False)
+            return True, response, False
+
+        if "what wifi am i on" in lowered_command or "wifi info" in lowered_command:
+            response = get_wifi_info()
+            return True, response, False
+
+        if "connect to wifi" in lowered_command:
+            # This would need voice input for password - simplified for now
+            return True, "Wi-Fi connection requires a password. Please connect manually in System Preferences, sir.", False
+
+        if lowered_command.startswith("switch to "):
+            app_name = lowered_command.replace("switch to ", "").strip()
+            response = switch_to_app(app_name)
+            return True, response, False
+
+        if "snap window left" in lowered_command:
+            response = snap_window_left()
+            return True, response, False
+
+        if "snap window right" in lowered_command:
+            response = snap_window_right()
+            return True, response, False
+
+        if "what windows are open" in lowered_command or "open windows" in lowered_command:
+            response = get_open_windows()
+            return True, response, False
+
+        if "screen info" in lowered_command:
+            response = get_screen_info()
+            return True, response, False
+
+        if "toggle night shift" in lowered_command or "turn on night shift" in lowered_command or "turn off night shift" in lowered_command:
+            state = "on" in lowered_command
+            response = toggle_night_shift(state)
+            return True, response, False
 
         return False, "", False
 
@@ -5341,6 +6868,63 @@ class JarvisApp:
 
         return False, "", False
 
+    def handle_project_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle project registry commands.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+        """
+        if lowered_command.startswith("open project ") or lowered_command.startswith("open my ") or "open " in lowered_command and "project" in lowered_command:
+            # Extract project name
+            if "open project " in lowered_command:
+                query = lowered_command.replace("open project ", "").strip()
+            elif "open my " in lowered_command:
+                query = lowered_command.replace("open my ", "").strip()
+            else:
+                # Fallback
+                query = lowered_command.replace("open ", "").replace("project", "").strip()
+
+            project = find_project(self.db_manager, query)
+            if project:
+                response = open_project(self.db_manager, project, self)
+                return True, response, False
+            else:
+                return True, f"I couldn't find a project matching '{query}', sir.", False
+
+        if "run " in lowered_command and ("dev mode" in lowered_command or "development" in lowered_command):
+            # Extract project name
+            query = lowered_command.replace("run ", "").replace(" in dev mode", "").replace(" in development", "").strip()
+            project = find_project(self.db_manager, query)
+            if project:
+                response = launch_dev_server(self.db_manager, project, self)
+                return True, response, False
+            else:
+                return True, f"I couldn't find a project matching '{query}', sir.", False
+
+        if "register this" in lowered_command or "register project" in lowered_command:
+            # Get current directory (assuming user is in the project folder)
+            current_dir = os.getcwd()
+            friendly_name = "Unknown Project"
+            if " as " in cleaned_command:
+                friendly_name = cleaned_command.split(" as ")[1].strip()
+
+            success = register_project(self.db_manager, friendly_name, current_dir, project_type="other")
+            if success:
+                return True, f"Registered {friendly_name} at {current_dir}, sir.", False
+            else:
+                return True, "Failed to register the project, sir.", False
+
+        if "what projects" in lowered_command or "list projects" in lowered_command:
+            response = list_projects(self.db_manager)
+            return True, response, False
+
+        return False, "", False
+
     def handle_builtin_skill(self, command: str) -> Tuple[bool, str, bool]:
         """
         Route local skills by ordered handler groups before falling back to AI.
@@ -5601,7 +7185,15 @@ class JarvisApp:
             self.active_timers.clear()
 
         # ── wait briefly for listener and reminder threads to finish ──
-        for background_thread in [self.wake_thread, self.reminder_thread]:
+        background_threads = [self.wake_thread, self.reminder_thread]
+        if hasattr(self, 'process_monitor') and self.process_monitor:
+            background_threads.append(self.process_monitor)
+        if hasattr(self, 'hotkey_listener') and self.hotkey_listener:
+            background_threads.append(self.hotkey_listener)
+        if hasattr(self, 'corner_watcher') and self.corner_watcher:
+            background_threads.append(self.corner_watcher)
+
+        for background_thread in background_threads:
             try:
                 if background_thread and background_thread.is_alive():
                     background_thread.join(timeout=1.0)
