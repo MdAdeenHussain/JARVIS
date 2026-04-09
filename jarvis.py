@@ -108,6 +108,21 @@ except ImportError:
     send2trash = None
 
 try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    from scipy import signal
+except ImportError:
+    signal = None
+
+try:
     from PyQt6.QtCore import (
         QEasingCurve,
         QObject,
@@ -205,10 +220,12 @@ class AppConfig:
         db_password (str): PostgreSQL password.
         db_port (int): PostgreSQL port number.
         wake_word (str): Wake word JARVIS listens for.
-    voice_rate (int): Text-to-speech speaking rate.
-    history_limit (int): Maximum number of provider-specific history messages to retain.
-    primary_ai (str): Preferred AI provider at startup.
-    ui_mode (str): Presentation mode such as `both`, `terminal`, or `overlay`.
+        voice_rate (int): Text-to-speech speaking rate.
+        history_limit (int): Maximum number of provider-specific history messages to retain.
+        primary_ai (str): Preferred AI provider at startup.
+        ui_mode (str): Presentation mode such as `both`, `terminal`, or `overlay`.
+        clap_enabled (bool): Whether clap detection is enabled as primary activation.
+        clap_sensitivity (float): Sensitivity multiplier for clap detection threshold (0.0-1.0).
 
     Returns:
         None.
@@ -226,6 +243,8 @@ class AppConfig:
     history_limit: int
     primary_ai: str
     ui_mode: str
+    clap_enabled: bool
+    clap_sensitivity: float
 
 
 def parse_int_env(key: str, fallback: int) -> int:
@@ -248,6 +267,56 @@ def parse_int_env(key: str, fallback: int) -> int:
     # ── convert the text to an integer when possible ──
     try:
         return int(raw_value)
+    except Exception:
+        return fallback
+
+
+def parse_bool_env(key: str, fallback: bool) -> bool:
+    """
+    Parse a boolean environment variable safely.
+
+    Parameters:
+        key (str): The environment variable name to parse.
+        fallback (bool): The fallback boolean value if parsing fails.
+
+    Returns:
+        bool: A valid boolean value.
+
+    Exceptions:
+        This function does not raise exceptions; invalid values fall back safely.
+    """
+    # ── read the raw environment variable text ──
+    raw_value = os.getenv(key, "").strip().lower()
+
+    # ── convert common boolean representations ──
+    if raw_value in ("true", "1", "yes", "on"):
+        return True
+    elif raw_value in ("false", "0", "no", "off"):
+        return False
+    else:
+        return fallback
+
+
+def parse_float_env(key: str, fallback: float) -> float:
+    """
+    Parse a float environment variable safely.
+
+    Parameters:
+        key (str): The environment variable name to parse.
+        fallback (float): The fallback float value if parsing fails.
+
+    Returns:
+        float: A valid float value.
+
+    Exceptions:
+        This function does not raise exceptions; invalid values fall back safely.
+    """
+    # ── read the raw environment variable text ──
+    raw_value = os.getenv(key, "").strip()
+
+    # ── convert the text to a float when possible ──
+    try:
+        return float(raw_value)
     except Exception:
         return fallback
 
@@ -306,6 +375,8 @@ def load_and_validate_environment() -> Optional[AppConfig]:
         history_limit=max(1, parse_int_env("HISTORY_LIMIT", 10)),
         primary_ai=primary_ai,
         ui_mode=ui_mode,
+        clap_enabled=parse_bool_env("CLAP_ENABLED", True),
+        clap_sensitivity=max(0.0, min(1.0, parse_float_env("CLAP_SENSITIVITY", 0.7))),
     )
 
 
@@ -1040,6 +1111,7 @@ class JarvisAnimator:
         self.state_lock = threading.Lock()
         self.output_lock = threading.Lock()
         self.error_until = 0.0
+        self.activated_until = 0.0
         self.thread = threading.Thread(
             target=self._run_animation_loop,
             daemon=True,
@@ -1081,6 +1153,12 @@ class JarvisAnimator:
                 [
                     "⚠  ERROR  ████████████████",
                     "⚠  ERROR  ░░░░░░░░░░░░░░░░",
+                ]
+            ),
+            "activated": itertools.cycle(
+                [
+                    "🎯  ACTIVATED  ████████████████",
+                    "🎯  ACTIVATED  ░░░░░░░░░░░░░░░░",
                 ]
             ),
         }
@@ -1134,7 +1212,7 @@ class JarvisAnimator:
         Change the active animation state safely.
 
         Parameters:
-            state (str): One of `idle`, `listening`, `thinking`, `speaking`, or `error`.
+            state (str): One of `idle`, `listening`, `thinking`, `speaking`, `error`, or `activated`.
 
         Returns:
             None.
@@ -1147,6 +1225,8 @@ class JarvisAnimator:
             self.state = state
             if state == "error":
                 self.error_until = time.time() + 2.0
+            elif state == "activated":
+                self.activated_until = time.time() + 1.0  # 1 second flash
 
     def set_provider(self, provider: str) -> None:
         """
@@ -1257,6 +1337,8 @@ class JarvisAnimator:
             try:
                 with self.state_lock:
                     if self.state == "error" and time.time() >= self.error_until:
+                        self.state = "idle"
+                    elif self.state == "activated" and time.time() >= self.activated_until:
                         self.state = "idle"
                     current_state = self.state
                     current_provider = self.provider
@@ -2194,7 +2276,7 @@ class JarvisPresentationController:
         Update the shared state machine and fan it out to every UI backend.
 
         Parameters:
-            state (str): Shared state such as `idle`, `listening`, `thinking`, `speaking`, or `error`.
+            state (str): Shared state such as `idle`, `listening`, `thinking`, `speaking`, `error`, or `activated`.
             text (str): Optional state-associated text.
 
         Returns:
@@ -2645,6 +2727,200 @@ class SpeechRecognizerManager:
             if mode == "command" and prompt_on_failure:
                 self.tts_engine.speak("I didn't catch that, sir.")
             return None
+
+
+# ══════════════════════════════════════════════════════════
+# ██  CLAP DETECTOR — AUDIO ACTIVATION SYSTEM
+# ══════════════════════════════════════════════════════════
+
+
+class ClapDetector:
+    """
+    Detect double-clap activation using energy-based onset detection.
+
+    Continuously monitors audio stream for sharp transient peaks (claps) within
+    a 0.6-1.2 second window. Uses dynamic thresholding recalibrated every 5 seconds.
+
+    Parameters:
+        sensitivity (float): Multiplier for detection threshold (0.0-1.0).
+        on_clap_detected (callable): Callback function called when double clap detected.
+
+    Returns:
+        None.
+    """
+
+    def __init__(self, sensitivity: float = 0.7, on_clap_detected: callable = None):
+        """
+        Initialize the clap detector.
+
+        Args:
+            sensitivity (float): Sensitivity multiplier for threshold (0.0-1.0).
+            on_clap_detected (callable): Function to call when clap detected.
+        """
+        self.sensitivity = sensitivity
+        self.on_clap_detected = on_clap_detected
+
+        # Audio parameters
+        self.sample_rate = 44100
+        self.buffer_size = int(0.01 * self.sample_rate)  # 10ms frames
+        self.recalibration_interval = 5.0  # seconds
+
+        # Detection parameters
+        self.min_clap_window = 0.6  # seconds
+        self.max_clap_window = 1.2  # seconds
+        self.threshold_multiplier = 4.0  # mean + 4*std
+
+        # State variables
+        self.running = False
+        self.thread = None
+        self.last_recalibration = 0
+        self.energy_history = []
+        self.current_threshold = 0.01  # initial threshold
+
+        # Clap detection state
+        self.pending_claps = []  # timestamps of detected claps
+
+    def compute_rms_energy(self, frame: np.ndarray) -> float:
+        """
+        Compute RMS energy of an audio frame.
+
+        Args:
+            frame (np.ndarray): Audio frame data.
+
+        Returns:
+            float: RMS energy value.
+        """
+        return np.sqrt(np.mean(frame ** 2))
+
+    def recalibrate_threshold(self):
+        """Recalibrate dynamic threshold using recent ambient noise levels."""
+        if not self.energy_history:
+            return
+
+        energies = np.array(self.energy_history[-int(self.recalibration_interval / 0.01):])
+        if len(energies) < 10:  # need minimum samples
+            return
+
+        mean_energy = np.mean(energies)
+        std_energy = np.std(energies)
+        self.current_threshold = (mean_energy + self.threshold_multiplier * std_energy) * self.sensitivity
+
+        # Clear old history to prevent memory growth
+        self.energy_history = self.energy_history[-1000:]  # keep last 1000 samples
+
+    def detect_onset(self, energy: float) -> bool:
+        """
+        Detect if current energy represents a clap onset.
+
+        Args:
+            energy (float): Current frame RMS energy.
+
+        Returns:
+            bool: True if onset detected.
+        """
+        return energy > self.current_threshold
+
+    def check_double_clap(self) -> bool:
+        """
+        Check if pending claps form a valid double clap pattern.
+
+        Returns:
+            bool: True if valid double clap detected.
+        """
+        if len(self.pending_claps) < 2:
+            return False
+
+        # Check time window between last two claps
+        time_diff = self.pending_claps[-1] - self.pending_claps[-2]
+        if self.min_clap_window <= time_diff <= self.max_clap_window:
+            # Valid double clap - clear pending claps
+            self.pending_claps.clear()
+            return True
+
+        # If too much time has passed, remove old claps
+        current_time = time.time()
+        self.pending_claps = [t for t in self.pending_claps if current_time - t < self.max_clap_window]
+
+        return False
+
+    def audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
+        """
+        Audio stream callback for real-time processing.
+
+        Args:
+            indata (np.ndarray): Audio frame data.
+            frames (int): Number of frames.
+            time_info: Time information.
+            status: Stream status.
+        """
+        if status:
+            print(f"Audio status: {status}")
+            return
+
+        # Compute energy for this frame
+        energy = self.compute_rms_energy(indata[:, 0])  # Use left channel
+        self.energy_history.append(energy)
+
+        # Recalibrate threshold periodically
+        current_time = time.time()
+        if current_time - self.last_recalibration >= self.recalibration_interval:
+            self.recalibrate_threshold()
+            self.last_recalibration = current_time
+
+        # Check for onset
+        if self.detect_onset(energy):
+            self.pending_claps.append(current_time)
+
+            # Check for double clap
+            if self.check_double_clap():
+                if self.on_clap_detected:
+                    self.on_clap_detected()
+
+    def play_activation_tone(self):
+        """Play a short 440Hz sine wave confirmation tone."""
+        if sd is None:
+            return
+
+        duration = 0.2  # 200ms
+        frequency = 440  # A4 note
+        t = np.linspace(0, duration, int(self.sample_rate * duration), False)
+        tone = 0.3 * np.sin(2 * np.pi * frequency * t)  # 30% volume
+
+        try:
+            sd.play(tone, samplerate=self.sample_rate)
+            sd.wait()  # Wait for playback to finish
+        except Exception as e:
+            print(f"Failed to play activation tone: {e}")
+
+    def start(self):
+        """Start the clap detection thread."""
+        if self.running:
+            return
+
+        self.running = True
+        self.thread = threading.Thread(target=self._run, name="jarvis-clap-detector", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """Stop the clap detection thread."""
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+    def _run(self):
+        """Main clap detection loop."""
+        try:
+            with sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                blocksize=self.buffer_size,
+                callback=self.audio_callback
+            ):
+                while self.running:
+                    time.sleep(0.1)  # Prevent busy waiting
+        except Exception as e:
+            print(f"Clap detection error: {e}")
+            self.running = False
 
 
 # ══════════════════════════════════════════════════════════
@@ -3442,9 +3718,14 @@ class JarvisApp:
         self.speech_manager = SpeechRecognizerManager(self.animator, self.tts_engine, self.logger)
         self.db_manager = DatabaseManager(config, self.logger)
         self.ai_router = AIRouter(config, self.logger, self.db_manager, self.animator)
+        self.clap_detector = ClapDetector(
+            sensitivity=config.clap_sensitivity,
+            on_clap_detected=self._on_clap_detected
+        )
 
         self.wake_thread: Optional[threading.Thread] = None
         self.reminder_thread: Optional[threading.Thread] = None
+        self.clap_thread: Optional[threading.Thread] = None
         self.active_timers: List[threading.Timer] = []
         self.timers_lock = threading.Lock()
 
@@ -4110,6 +4391,12 @@ class JarvisApp:
             print("Microphone initialization failed. Please check permissions and audio dependencies.")
             return False
 
+        # ── initialize clap detection if enabled ──
+        self.clap_ready = self.config.clap_enabled and sd is not None and np is not None
+        if self.config.clap_enabled and not self.clap_ready:
+            print("Clap detection enabled but dependencies missing. Install sounddevice and numpy.")
+            self.clap_ready = False
+
         # ── initialize text-to-speech; failure is non-fatal because terminal output still works ──
         self.tts_engine.initialize_engine()
 
@@ -4141,6 +4428,11 @@ class JarvisApp:
 
         # ── begin the always-on wake-word loop in the background ──
         self.start_wake_listener_thread()
+
+        # ── begin clap detection if enabled ──
+        if self.clap_ready:
+            self.start_clap_detector_thread()
+
         return True
 
     def print_status_panel(self) -> None:
@@ -4161,6 +4453,7 @@ class JarvisApp:
         groq_mark = "✓" if self.provider_status.get("groq") else "✗"
         db_mark = "✓"
         mic_mark = "✓" if self.microphone_ready else "✗"
+        clap_mark = "✓" if self.clap_ready else "✗"
         ui_mode = self.config.ui_mode.title()
 
         # ── build the requested terminal status panel ──
@@ -4172,6 +4465,7 @@ class JarvisApp:
             f"│  Fallback AI  : Groq LLaMA3        {groq_mark}   │\n"
             f"│  Database     : PostgreSQL         {db_mark}   │\n"
             f"│  Microphone   : Ready              {mic_mark}   │\n"
+            f"│  Clap Detect  : {'Enabled' if self.config.clap_enabled else 'Disabled'} {clap_mark}   │\n"
             f"│  UI Mode      : {ui_mode}{' ' * max(0, 19 - len(ui_mode))}│\n"
             f"│  Wake Word    : \"{self.config.wake_word}\"{' ' * max(0, 14 - len(self.config.wake_word))}│\n"
             f"│  Session ID   : {self.session_id}{' ' * max(0, 23 - len(self.session_id))}│\n"
@@ -4220,6 +4514,87 @@ class JarvisApp:
             name="jarvis-reminder-checker",
         )
         self.reminder_thread.start()
+
+    def start_clap_detector_thread(self) -> None:
+        """
+        Start the background clap detection thread.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        # ── create the daemon clap detector thread ──
+        self.clap_detector.start()
+
+    def _on_clap_detected(self) -> None:
+        """
+        Handle double-clap detection activation.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method catches and logs errors.
+        """
+        try:
+            # ── flash HUD activation signal ──
+            self.animator.set_state("activated", "ACTIVATED")
+
+            # ── play confirmation tone ──
+            self.clap_detector.play_activation_tone()
+
+            # ── start voice command listening ──
+            self.process_command_from_clap()
+
+        except Exception as e:
+            self.logger.error("Clap activation failed: %s", e)
+
+    def process_command_from_clap(self) -> None:
+        """
+        Process voice command after clap activation.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method catches and logs errors.
+        """
+        try:
+            # ── set command active to pause other listeners ──
+            self.command_active.set()
+
+            # ── listen for voice command ──
+            self.animator.set_state("listening", "Listening...")
+            command_text = self.speech_manager.listen_for_text(
+                timeout=5,  # Shorter timeout after activation
+                phrase_time_limit=8,
+                mode="command",
+                prompt_on_failure=True
+            )
+
+            if command_text:
+                # ── process the command ──
+                self.process_command_thread(command_text)
+            else:
+                # ── reset state if no command heard ──
+                self.animator.set_state("idle")
+
+        except Exception as e:
+            self.logger.error("Command processing from clap failed: %s", e)
+            self.animator.set_state("idle")
+        finally:
+            self.command_active.clear()
 
     def schedule_timer_alert(self, seconds: int, reminder_id: Optional[int], message: str) -> None:
         """
@@ -5591,6 +5966,10 @@ class JarvisApp:
         # ── signal all background threads to stop their loops ──
         self.stop_background_threads.set()
 
+        # ── stop clap detector ──
+        if hasattr(self, 'clap_detector'):
+            self.clap_detector.stop()
+
         # ── cancel any outstanding local timers so shutdown is clean ──
         with self.timers_lock:
             for timer in self.active_timers:
@@ -5601,7 +5980,7 @@ class JarvisApp:
             self.active_timers.clear()
 
         # ── wait briefly for listener and reminder threads to finish ──
-        for background_thread in [self.wake_thread, self.reminder_thread]:
+        for background_thread in [self.wake_thread, self.reminder_thread, self.clap_thread]:
             try:
                 if background_thread and background_thread.is_alive():
                     background_thread.join(timeout=1.0)
