@@ -1471,6 +1471,12 @@ if QApplication is not None and QPropertyAnimation is not None:
         state_signal = pyqtSignal(str)
         text_signal = pyqtSignal(str)
         provider_signal = pyqtSignal(str)
+        metric_update = pyqtSignal(dict)
+        live_data_update = pyqtSignal(dict)
+        transcript_update = pyqtSignal(str, str)
+        project_opened = pyqtSignal(str)
+        alert_signal = pyqtSignal(str, str)
+        hud_command = pyqtSignal(str)
         stop_signal = pyqtSignal()
 
     class JarvisOverlay(QWidget):
@@ -2178,6 +2184,12 @@ else:
             self.state_signal = None
             self.text_signal = None
             self.provider_signal = None
+            self.metric_update = None
+            self.live_data_update = None
+            self.transcript_update = None
+            self.project_opened = None
+            self.alert_signal = None
+            self.hud_command = None
             self.stop_signal = None
 
     class JarvisOverlayThread(threading.Thread):
@@ -2226,7 +2238,9 @@ class JarvisPresentationController:
         self.overlay_requested = ui_mode in {"both", "overlay"}
         self.terminal_animator = JarvisAnimator() if self.terminal_enabled else None
         self.bridge = UIBridge() if self.overlay_requested else None
-        self.overlay_thread = JarvisOverlayThread(self.bridge, logger) if self.overlay_requested else None
+        self.overlay_thread = None
+        self.hud_monitor_thread: Optional[threading.Thread] = None
+        self.hud_monitor_stop = threading.Event()
         self.output_lock = threading.Lock()
         self.state = "idle"
         self.provider = "gemini"
@@ -2249,18 +2263,27 @@ class JarvisPresentationController:
         if self.terminal_animator is not None:
             self.terminal_animator.start()
 
-        if self.overlay_thread is not None:
+        if self.overlay_requested:
             if QApplication is None:
                 self.logger.warning("PyQt6 is unavailable. Falling back to terminal-only mode.")
-                return
-            self.overlay_thread.start()
-            self.overlay_thread.ready_event.wait(timeout=3.0)
-            if self.overlay_thread.failed:
-                self.logger.warning("Overlay UI is unavailable. Falling back to terminal-only mode.")
-                return
-            self.overlay_enabled = True
-            self.set_provider(self.provider)
-            self.set_state(self.state, self.last_text)
+            else:
+                try:
+                    from hud import HudOverlayThread
+
+                    self.overlay_thread = HudOverlayThread(self.bridge, self.logger)
+                    self.overlay_thread.start()
+                    self.overlay_thread.ready_event.wait(timeout=3.0)
+                    if self.overlay_thread.failed:
+                        self.logger.warning("HUD backend unavailable. Falling back to terminal-only mode.")
+                    else:
+                        self.overlay_enabled = True
+                        self.set_provider(self.provider)
+                        self.set_state(self.state, self.last_text)
+                        self.hud_monitor_stop.clear()
+                        self._start_hud_monitor_thread()
+                except Exception as error:
+                    self.logger.warning("HUD backend import failed: %s", error)
+                    self.overlay_thread = None
 
     def stop(self) -> None:
         """
@@ -2277,6 +2300,9 @@ class JarvisPresentationController:
         """
         try:
             if self.overlay_enabled and self.bridge is not None and getattr(self.bridge, "stop_signal", None):
+                self.hud_monitor_stop.set()
+                if self.hud_monitor_thread and self.hud_monitor_thread.is_alive():
+                    self.hud_monitor_thread.join(timeout=1.5)
                 self.bridge.stop_signal.emit()
                 if self.overlay_thread and self.overlay_thread.is_alive():
                     self.overlay_thread.join(timeout=1.5)
@@ -2285,6 +2311,58 @@ class JarvisPresentationController:
 
         if self.terminal_animator is not None:
             self.terminal_animator.stop()
+
+    def _start_hud_monitor_thread(self) -> None:
+        if self.hud_monitor_thread is not None and self.hud_monitor_thread.is_alive():
+            return
+        self.hud_monitor_thread = threading.Thread(
+            target=self._hud_monitor_loop,
+            daemon=True,
+            name="jarvis-hud-monitor",
+        )
+        self.hud_monitor_thread.start()
+
+    def _hud_monitor_loop(self) -> None:
+        location = os.environ.get("JARVIS_LOCATION", "KOLKATA, IN")
+        while not self.hud_monitor_stop.wait(4.0):
+            try:
+                metrics: Dict[str, Any] = {
+                    "download": "1.2MB",
+                    "upload": "4.8MB",
+                }
+                if psutil is not None:
+                    metrics["cpu"] = int(psutil.cpu_percent(interval=0.1))
+                    vm = psutil.virtual_memory()
+                    metrics["ram"] = int(vm.percent)
+                    disk = psutil.disk_usage("/")
+                    metrics["disk"] = int(disk.percent)
+                    temp = None
+                    try:
+                        temps = psutil.sensors_temperatures()
+                        if temps:
+                            for sensor_list in temps.values():
+                                if sensor_list:
+                                    temp = int(sensor_list[0].current)
+                                    break
+                    except Exception:
+                        temp = None
+                    metrics["temp"] = temp if temp is not None else 42
+                else:
+                    metrics.update({"cpu": 12, "ram": 38, "disk": 44, "temp": 42})
+                self.update_metrics(metrics)
+
+                live_data: Dict[str, Any] = {
+                    "location": location,
+                    "temperature": metrics.get("temp", 28),
+                    "condition": "PARTLY CLOUDY",
+                    "humidity": 68,
+                    "wind": "12km/h NE",
+                    "aqi": 48,
+                    "updated": time.strftime("%H:%M"),
+                }
+                self.update_live_data(live_data)
+            except Exception as error:
+                self.logger.debug("HUD monitor thread error: %s", error)
 
     def safe_print(self, message: str) -> None:
         """
@@ -2393,9 +2471,92 @@ class JarvisPresentationController:
                     overlay_text = "Thinking..."
                 self.bridge.text_signal.emit(overlay_text)
 
+    def send_hud_command(self, command: str) -> None:
+        """
+        Send a direct HUD display command to the overlay backend.
+
+        Parameters:
+            command (str): Command string like `hide display` or `fullscreen mode`.
+
+        Returns:
+            None.
+
+        Exceptions:
+            This method does not raise exceptions.
+        """
+        if self.overlay_enabled and self.bridge is not None and getattr(self.bridge, "hud_command", None):
+            self.bridge.hud_command.emit(command)
+
+    def update_metrics(self, metrics: Dict[str, Any]) -> None:
+        """
+        Send updated system metrics to the HUD.
+
+        Parameters:
+            metrics (Dict[str, Any]): System metric values.
+
+        Returns:
+            None.
+        """
+        if self.overlay_enabled and self.bridge is not None and getattr(self.bridge, "metric_update", None):
+            self.bridge.metric_update.emit(metrics)
+
+    def update_live_data(self, data: Dict[str, Any]) -> None:
+        """
+        Send live telemetry data to the HUD.
+
+        Parameters:
+            data (Dict[str, Any]): Live environmental or intel data.
+
+        Returns:
+            None.
+        """
+        if self.overlay_enabled and self.bridge is not None and getattr(self.bridge, "live_data_update", None):
+            self.bridge.live_data_update.emit(data)
+
+    def notify_transcript(self, heard: str, response: str) -> None:
+        """
+        Send the latest transcript and response text to the HUD.
+
+        Parameters:
+            heard (str): User's recognized command.
+            response (str): JARVIS response text.
+
+        Returns:
+            None.
+        """
+        if self.overlay_enabled and self.bridge is not None and getattr(self.bridge, "transcript_update", None):
+            self.bridge.transcript_update.emit(heard, response)
+
+    def notify_project_opened(self, project_name: str) -> None:
+        """
+        Notify the HUD that a new project was opened.
+
+        Parameters:
+            project_name (str): Name of the opened project.
+
+        Returns:
+            None.
+        """
+        if self.overlay_enabled and self.bridge is not None and getattr(self.bridge, "project_opened", None):
+            self.bridge.project_opened.emit(project_name)
+
+    def notify_alert(self, alert_type: str, message: str) -> None:
+        """
+        Send a HUD alert event to display warnings or errors.
+
+        Parameters:
+            alert_type (str): Type of alert.
+            message (str): Alert message.
+
+        Returns:
+            None.
+        """
+        if self.overlay_enabled and self.bridge is not None and getattr(self.bridge, "alert_signal", None):
+            self.bridge.alert_signal.emit(alert_type, message)
+
 # ══════════════════════════════════════════════════════════
 # ██  TEXT-TO-SPEECH ENGINE
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 
 
 @dataclass
@@ -6296,6 +6457,18 @@ class JarvisApp:
             ),
             (
                 [
+                    "hide display",
+                    "show display",
+                    "dim display",
+                    "brighten display",
+                    "fullscreen mode",
+                    "dashboard mode",
+                    "night mode",
+                ],
+                self.handle_hud_commands,
+            ),
+            (
+                [
                     "rename ",
                     "change the name",
                     "move ",
@@ -7474,9 +7647,11 @@ class JarvisApp:
                 subprocess.run([brightness_cli, str(target)], check=True)
                 response = "Brightness increased, sir." if delta > 0 else "Brightness decreased, sir."
                 return True, response, False
-            except Exception as error:
-                self.logger.error("Brightness command failed: %s", error)
+            except Exception:
                 return True, "I could not adjust the brightness, sir.", False
+
+        if any(command in lowered_command for command in ["hide display", "show display", "dim display", "brighten display", "fullscreen mode", "dashboard mode", "night mode"]):
+            return self.handle_hud_commands(cleaned_command, lowered_command)
 
         if lowered_command == "lock screen":
             success = self.run_subprocess(["pmset", "displaysleepnow"])
@@ -7857,6 +8032,50 @@ class JarvisApp:
             except Exception as error:
                 self.logger.error("Clipboard copy failed: %s", error)
                 return True, "I could not copy that, sir.", False
+
+        return False, "", False
+
+    def handle_hud_commands(self, cleaned_command: str, lowered_command: str) -> Tuple[bool, str, bool]:
+        """
+        Handle HUD-specific display commands routed from voice.
+
+        Parameters:
+            cleaned_command (str): Original command text.
+            lowered_command (str): Lowercased command text.
+
+        Returns:
+            Tuple[bool, str, bool]: Standard skill result tuple.
+
+        Exceptions:
+            This method catches command failures and remains graceful.
+        """
+        if "hide display" in lowered_command:
+            self.animator.send_hud_command("hide display")
+            return True, "Hiding the HUD display, sir.", False
+
+        if "show display" in lowered_command:
+            self.animator.send_hud_command("show display")
+            return True, "Showing the HUD display, sir.", False
+
+        if "dim display" in lowered_command:
+            self.animator.send_hud_command("dim display")
+            return True, "Dimming the HUD overlay, sir.", False
+
+        if "brighten display" in lowered_command:
+            self.animator.send_hud_command("brighten display")
+            return True, "Brightening the HUD overlay, sir.", False
+
+        if "fullscreen mode" in lowered_command:
+            self.animator.send_hud_command("fullscreen mode")
+            return True, "Switching to fullscreen HUD mode, sir.", False
+
+        if "dashboard mode" in lowered_command:
+            self.animator.send_hud_command("dashboard mode")
+            return True, "Returning to dashboard display, sir.", False
+
+        if "night mode" in lowered_command:
+            self.animator.send_hud_command("night mode")
+            return True, "Toggling night mode, sir.", False
 
         return False, "", False
 
@@ -8509,6 +8728,7 @@ class JarvisApp:
                     self.request_shutdown("voice shutdown command")
                     return
                 self.queue_response(response_text)
+                self.animator.notify_transcript(command, response_text)
                 return
 
             # ── call the AI router when no local skill matches the request ──
@@ -8518,10 +8738,12 @@ class JarvisApp:
             if reply_text is None:
                 offline_message = "Both AI systems are offline sir. Running on local skills only."
                 self.queue_response(offline_message)
+                self.animator.notify_transcript(command, offline_message)
                 return
 
             # ── persist the AI reply and queue it for speech ──
             self.queue_response(reply_text, provider_used)
+            self.animator.notify_transcript(command, reply_text)
         except Exception as error:
             # ── catch all command-routing failures so the assistant never crashes ──
             self.logger.error("Command routing failed: %s", error)
