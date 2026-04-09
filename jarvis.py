@@ -156,6 +156,21 @@ except ImportError:
     keyboard = None
     mouse = None
 
+try:
+    import spacy
+except ImportError:
+    spacy = None
+
+try:
+    from dateutil import parser as dateutil_parser
+except ImportError:
+    dateutil_parser = None
+
+try:
+    from functools import lru_cache
+except ImportError:
+    lru_cache = None
+
 
 # ══════════════════════════════════════════════════════════
 # ██  ENVIRONMENT & CONFIG LOADER
@@ -242,6 +257,13 @@ class AppConfig:
     corner_trigger_enabled: bool
     corner_trigger_corner: str
     corner_trigger_delay_ms: int
+    local_llm_enabled: bool
+    local_llm_model: str
+    local_llm_timeout: int
+    ollama_base_url: str
+    offline_fallback_to_local: bool
+    ai_priority: str
+    system_prompt_refresh_minutes: int
 
 
 def parse_int_env(key: str, fallback: int) -> int:
@@ -330,6 +352,13 @@ def load_and_validate_environment() -> Optional[AppConfig]:
         corner_trigger_enabled=os.getenv("CORNER_TRIGGER_ENABLED", "true").strip().lower() == "true",
         corner_trigger_corner=os.getenv("CORNER_TRIGGER_CORNER", "top-right").strip().lower(),
         corner_trigger_delay_ms=parse_int_env("CORNER_TRIGGER_DELAY_MS", 1200),
+        local_llm_enabled=os.getenv("LOCAL_LLM_ENABLED", "true").strip().lower() == "true",
+        local_llm_model=os.getenv("LOCAL_LLM_MODEL", "phi3:mini").strip(),
+        local_llm_timeout=parse_int_env("LOCAL_LLM_TIMEOUT", 30),
+        ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip(),
+        offline_fallback_to_local=os.getenv("OFFLINE_FALLBACK_TO_LOCAL", "true").strip().lower() == "true",
+        ai_priority=os.getenv("AI_PRIORITY", "gemini,groq,ollama").strip().lower(),
+        system_prompt_refresh_minutes=parse_int_env("SYSTEM_PROMPT_REFRESH_MINUTES", 30),
     )
 
 
@@ -386,10 +415,8 @@ def setup_logging() -> logging.Logger:
 
 LOGGER = setup_logging()
 
-
-# ══════════════════════════════════════════════════════════
-# ██  DATABASE — POSTGRESQL
-# ══════════════════════════════════════════════════════════
+# ── Phase 2: Embedding engine singleton for semantic memory ──
+_embedding_engine_instance = None
 
 
 class DatabaseManager:
@@ -657,6 +684,82 @@ class DatabaseManager:
                 # ── create indexes for file access log ──
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_access_path ON file_access_log(file_path);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_access_count ON file_access_log(open_count DESC);")
+
+                # ── PHASE 2: Enable pgvector extension if available ──
+                try:
+                    cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                except Exception:
+                    pass  # pgvector extension not installed, continue without it
+
+                # ── PHASE 2: Upgrade memory table with embeddings ──
+                cursor.execute("""
+                    ALTER TABLE memory ADD COLUMN IF NOT EXISTS embedding vector(384);
+                    ALTER TABLE memory ADD COLUMN IF NOT EXISTS importance_score FLOAT DEFAULT 0.5;
+                    ALTER TABLE memory ADD COLUMN IF NOT EXISTS access_count INT DEFAULT 0;
+                    ALTER TABLE memory ADD COLUMN IF NOT EXISTS last_accessed TIMESTAMP;
+                """)
+
+                # ── PHASE 2: Create conversation embeddings table ──
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS conversation_embeddings (
+                        id SERIAL PRIMARY KEY,
+                        session_id TEXT,
+                        turn_index INT,
+                        role VARCHAR(20),
+                        content TEXT,
+                        embedding vector(384),
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        topics TEXT[]
+                    );
+                """)
+
+                # ── PHASE 2: Create session summaries table ──
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS session_summaries (
+                        id SERIAL PRIMARY KEY,
+                        session_id TEXT UNIQUE,
+                        summary TEXT,
+                        topics TEXT[],
+                        embedding vector(384),
+                        message_count INT,
+                        started_at TIMESTAMP,
+                        ended_at TIMESTAMP
+                    );
+                """)
+
+                # ── PHASE 2: Create user profile table ──
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_profile (
+                        key VARCHAR(100) PRIMARY KEY,
+                        value TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+
+                # ── PHASE 2: Create vector search indexes ──
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_memory_embedding 
+                        ON memory USING ivfflat (embedding vector_cosine_ops) WITH (lists = 50);
+                    """)
+                except Exception:
+                    pass  # pgvector indexes not supported, continue
+
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_conv_embedding 
+                        ON conversation_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+                    """)
+                except Exception:
+                    pass
+
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_session_time 
+                        ON session_summaries (ended_at DESC);
+                    """)
+                except Exception:
+                    pass
 
             # ── commit all schema changes as one setup unit ──
             connection.commit()
@@ -2972,6 +3075,7 @@ class GroqBrain:
         if not reply_text:
             raise RuntimeError("Groq returned an empty response.")
 
+
         # ── update Groq-specific history using its own OpenAI-compatible schema ──
         self.history.append({"role": "user", "content": user_text})
         self.history.append({"role": "assistant", "content": reply_text})
@@ -2981,6 +3085,491 @@ class GroqBrain:
         usage = getattr(response, "usage", None)
         total_tokens = getattr(usage, "total_tokens", None) if usage else None
         return reply_text, total_tokens
+
+
+# ══════════════════════════════════════════════════════════
+# ██  EMBEDDING ENGINE — SEMANTIC MEMORY & SEARCH
+# ══════════════════════════════════════════════════════════
+
+
+class EmbeddingEngine:
+    """
+    Singleton embedding engine using sentence-transformers for semantic memory.
+
+    Parameters:
+        model_name (str): SentenceTransformer model name (default: all-MiniLM-L6-v2).
+
+    Returns:
+        None.
+
+    Exceptions:
+        Catches ImportError if sentence-transformers not installed.
+    """
+
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        """Ensure singleton pattern with thread safety."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        """Initialize embedding engine with lazy-loading."""
+        if hasattr(self, "_initialized"):
+            return
+        self._initialized = True
+        self.model_name = model_name
+        self.model = None
+        self.embedding_cache = {}
+        self.cache_lock = threading.Lock()
+        self._load_model()
+
+    def _load_model(self):
+        """Lazy-load the sentence-transformer model on first use."""
+        try:
+            from sentence_transformers import SentenceTransformer
+            LOGGER.info(f"Loading embedding model: {self.model_name}")
+            self.model = SentenceTransformer(self.model_name)
+            LOGGER.info(f"Embedding model loaded successfully ({self.model.get_sentence_embedding_dimension()} dims)")
+        except ImportError:
+            LOGGER.error("sentence-transformers not installed; semantic search unavailable")
+            self.model = None
+
+    def embed(self, text: str) -> list:
+        """
+        Embed a single text string into a 384-dimensional vector.
+
+        Parameters:
+            text (str): Text to embed.
+
+        Returns:
+            list: 384-dimensional embedding vector.
+        """
+        if self.model is None:
+            return [0.0] * 384
+
+        # ── check cache first to avoid re-computing identical queries ──
+        text_key = text.lower().strip()
+        if text_key in self.embedding_cache:
+            return self.embedding_cache[text_key]
+
+        # ── compute embedding with LRU cache eviction ──
+        with self.cache_lock:
+            if text_key in self.embedding_cache:
+                return self.embedding_cache[text_key]
+
+            embedding = self.model.encode(text, convert_to_tensor=False).tolist()
+
+            # ── simple LRU: keep only last 500 embeddings to save memory ──
+            if len(self.embedding_cache) >= 500:
+                oldest_key = next(iter(self.embedding_cache))
+                del self.embedding_cache[oldest_key]
+
+            self.embedding_cache[text_key] = embedding
+            return embedding
+
+    def embed_batch(self, texts: list) -> list:
+        """
+        Embed multiple texts efficiently.
+
+        Parameters:
+            texts (list): List of text strings.
+
+        Returns:
+            list: List of embedding vectors.
+        """
+        if self.model is None:
+            return [[0.0] * 384] * len(texts)
+
+        embeddings = []
+        for text in texts:
+            embeddings.append(self.embed(text))
+        return embeddings
+
+    def similarity(self, vec1: list, vec2: list) -> float:
+        """
+        Calculate cosine similarity between two vectors.
+
+        Parameters:
+            vec1 (list): First embedding vector.
+            vec2 (list): Second embedding vector.
+
+        Returns:
+            float: Cosine similarity score (0-1).
+        """
+        try:
+            from sklearn.metrics.pairwise import cosine_similarity
+            import numpy as np
+            sim = cosine_similarity([vec1], [vec2])[0][0]
+            return float(sim)
+        except Exception as error:
+            LOGGER.warning(f"Similarity calculation failed: {error}")
+            return 0.0
+
+
+# ══════════════════════════════════════════════════════════
+# ██  OLLAMA PROVIDER — LOCAL LLM FALLBACK
+# ══════════════════════════════════════════════════════════
+
+
+class OllamaProvider:
+    """
+    Interface to local Ollama LLM running on localhost:11434.
+
+    Parameters:
+        config (AppConfig): Validated runtime configuration.
+        logger (logging.Logger): Logger for provider events.
+
+    Returns:
+        None.
+
+    Exceptions:
+        Methods catch HTTP errors and connectivity issues gracefully.
+    """
+
+    def __init__(self, config: AppConfig = None, logger: logging.Logger = None):
+        """Initialize Ollama provider with configuration."""
+        self.config = config
+        self.logger = logger or LOGGER
+        self.available = False
+        self.base_url = "http://localhost:11434"
+        self.timeout = 30  # CPU inference is slower than cloud
+        self.history = []
+        self.model_name = "phi3:mini"  # Default model optimized for 8GB RAM
+        self.history_limit = 6  # Keep token count under 4096
+
+        # Extract model name from config if provided
+        if config and hasattr(config, "local_llm_model"):
+            self.model_name = config.local_llm_model
+        if config and hasattr(config, "local_llm_timeout"):
+            self.timeout = config.local_llm_timeout
+
+        # Attempt initial availability check
+        self.check_availability()
+
+    def check_availability(self) -> bool:
+        """
+        Check if Ollama is running and responsive.
+
+        Returns:
+            bool: True if Ollama is available, False otherwise.
+        """
+        try:
+            if requests is None:
+                self.logger.warning("requests library not available; Ollama disabled")
+                self.available = False
+                return False
+
+            response = requests.get(f"{self.base_url}/api/tags", timeout=2)
+            if response.status_code == 200:
+                self.available = True
+                self.logger.debug("Ollama provider is available")
+                return True
+            self.available = False
+            return False
+        except Exception as error:
+            self.available = False
+            self.logger.debug(f"Ollama not available: {error}")
+            return False
+
+    def initialize(self) -> bool:
+        """
+        Initialize Ollama provider at startup.
+
+        Returns:
+            bool: True if initialization successful.
+        """
+        if not requests:
+            self.logger.warning("requests library required for Ollama integration")
+            return False
+        return self.check_availability()
+
+    def send_message(self, user_text: str) -> Tuple[Optional[str], Optional[int]]:
+        """
+        Send a message to Ollama and retrieve response.
+
+        Parameters:
+            user_text (str): User input text.
+
+        Returns:
+            Tuple[Optional[str], Optional[int]]: (response_text, token_count) or (None, None) on failure.
+
+        Exceptions:
+            Catches HTTP errors, timeouts, and JSON parsing errors.
+        """
+        if not self.available:
+            return None, None
+
+        try:
+            # Append user message to history
+            self.history.append({"role": "user", "content": user_text})
+
+            # Trim history to keep context within token limit
+            self._trim_history()
+
+            # Build request payload
+            payload = {
+                "model": self.model_name,
+                "messages": self.history,
+                "stream": False,  # Required for voice compatibility (no chunked responses)
+                "temperature": 0.7,
+                "top_p": 0.9,
+            }
+
+            # POST to Ollama chat endpoint
+            response = requests.post(
+                f"{self.base_url}/api/chat", json=payload, timeout=self.timeout
+            )
+
+            if response.status_code != 200:
+                self.logger.warning(f"Ollama returned {response.status_code}")
+                return None, None
+
+            # Parse response
+            data = response.json()
+            reply_text = data.get("message", {}).get("content", "").strip()
+            if not reply_text:
+                self.logger.warning("Ollama returned empty response")
+                return None, None
+
+            # Append assistant response to history
+            self.history.append({"role": "assistant", "content": reply_text})
+            self._trim_history()
+
+            # Estimate token count (rough: 1 token ~= 4 chars)
+            token_count = len(self.history[-2].get("content", "")) // 4 + len(reply_text) // 4
+
+            self.logger.debug(f"Ollama response: {len(reply_text)} chars, ~{token_count} tokens")
+            return reply_text, token_count
+
+        except requests.Timeout:
+            self.logger.warning(f"Ollama request timed out after {self.timeout}s")
+            return None, None
+        except requests.ConnectionError:
+            self.logger.warning("Ollama connection failed")
+            self.available = False
+            return None, None
+        except Exception as error:
+            self.logger.warning(f"Ollama error: {error}")
+            return None, None
+
+    def _trim_history(self):
+        """Trim conversation history to stay within token budget."""
+        # Keep only last N messages to avoid exceeding 4096 token limit
+        if len(self.history) > self.history_limit:
+            self.history = self.history[-self.history_limit :]
+
+    def reset_history(self):
+        """Clear conversation history for new session."""
+        self.history = []
+
+
+# ══════════════════════════════════════════════════════════
+# ██  SYSTEM PROMPT BUILDER — DYNAMIC PERSONALITY
+# ══════════════════════════════════════════════════════════
+
+
+class SystemPromptBuilder:
+    """
+    Build dynamic system prompts for Ollama with personalized context.
+
+    Parameters:
+        db_manager (DatabaseManager): Database manager for fetching user context.
+        logger (logging.Logger): Logger for builder events.
+
+    Returns:
+        None.
+
+    Exceptions:
+        Methods catch database errors and return fallback prompts.
+    """
+
+    def __init__(self, db_manager=None, logger: logging.Logger = None):
+        """Initialize system prompt builder."""
+        self.db_manager = db_manager
+        self.logger = logger or LOGGER
+        self.last_built = None
+        self.rebuild_interval = 1800  # Rebuild every 30 minutes
+
+    def should_rebuild(self) -> bool:
+        """Check if system prompt needs rebuilding."""
+        if self.last_built is None:
+            return True
+        return time.time() - self.last_built > self.rebuild_interval
+
+    def build_dynamic_system_prompt(self) -> str:
+        """
+        Build a 5-block personalized system prompt for Ollama.
+
+        Returns:
+            str: Complete system prompt (~500-800 tokens).
+        """
+        try:
+            blocks = []
+
+            # ── Block 1: Static JARVIS identity ──
+            blocks.append(self._build_identity_block())
+
+            # ── Block 2: User profile ──
+            if self.db_manager:
+                user_profile_text = self._fetch_user_profile()
+                if user_profile_text:
+                    blocks.append(user_profile_text)
+
+            # ── Block 3: Active projects ──
+            if self.db_manager:
+                projects_text = self._fetch_active_projects()
+                if projects_text:
+                    blocks.append(projects_text)
+
+            # ── Block 4: Key memories ──
+            if self.db_manager:
+                memories_text = self._fetch_key_memories()
+                if memories_text:
+                    blocks.append(memories_text)
+
+            # ── Block 5: Time-of-day context ──
+            blocks.append(self._build_time_context_block())
+
+            self.last_built = time.time()
+            prompt = "\n\n".join(blocks)
+            self.logger.debug(f"Built dynamic system prompt ({len(prompt)} chars)")
+            return prompt
+
+        except Exception as error:
+            self.logger.warning(f"Error building system prompt: {error}")
+            return self._build_fallback_prompt()
+
+    def _build_identity_block(self) -> str:
+        """Build the static JARVIS identity block."""
+        return (
+            "You are JARVIS, a highly intelligent, concise, and witty AI assistant.\n"
+            "You are running on a Mac. Keep responses under 3 sentences unless asked for detail.\n"
+            "You maintain exceptional wit while being helpful and professional. Never break character."
+        )
+
+    def _build_time_context_block(self) -> str:
+        """Build time-of-day context for suggestions."""
+        hour = datetime.datetime.now().hour
+        if 5 <= hour < 12:
+            period = "morning"
+        elif 12 <= hour < 17:
+            period = "afternoon"
+        elif 17 <= hour < 21:
+            period = "evening"
+        else:
+            period = "night"
+
+        return f"It is currently {period}. Tailor suggestions to this time of day."
+
+    def _fetch_user_profile(self) -> str:
+        """Fetch user profile from database."""
+        try:
+            connection = self.db_manager._get_connection()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT key, value FROM user_profile WHERE key IN ('name', 'preferences', 'style') ORDER BY key"
+                    )
+                    rows = cursor.fetchall()
+                    if rows:
+                        profile_items = [f"{row[0]}: {row[1]}" for row in rows]
+                        return f"User Profile:\n- " + "\n- ".join(profile_items)
+                    return ""
+            finally:
+                self.db_manager._put_connection(connection)
+        except Exception as error:
+            self.logger.debug(f"Could not fetch user profile: {error}")
+            return ""
+
+    def _fetch_active_projects(self) -> str:
+        """Fetch top 5 recent projects from registry."""
+        try:
+            connection = self.db_manager._get_connection()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT name, description FROM project_registry
+                        ORDER BY last_accessed DESC
+                        LIMIT 5
+                        """
+                    )
+                    rows = cursor.fetchall()
+                    if rows:
+                        projects = [f"- {row[0]}: {row[1][:60]}..." if len(row[1]) > 60 else f"- {row[0]}: {row[1]}" for row in rows]
+                        return f"Current Projects:\n" + "\n".join(projects)
+                    return ""
+            finally:
+                self.db_manager._put_connection(connection)
+        except Exception as error:
+            self.logger.debug(f"Could not fetch projects: {error}")
+            return ""
+
+    def _fetch_key_memories(self) -> str:
+        """Fetch top 10 important memories."""
+        try:
+            connection = self.db_manager._get_connection()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT key, value FROM memory
+                        ORDER BY importance_score DESC, access_count DESC
+                        LIMIT 10
+                        """
+                    )
+                    rows = cursor.fetchall()
+                    if rows:
+                        memories = [f"- {row[0]}: {row[1][:50]}..." if len(row[1]) > 50 else f"- {row[0]}: {row[1]}" for row in rows]
+                        return f"Key Memories:\n" + "\n".join(memories)
+                    return ""
+            finally:
+                self.db_manager._put_connection(connection)
+        except Exception as error:
+            self.logger.debug(f"Could not fetch memories: {error}")
+            return ""
+
+    def _build_fallback_prompt(self) -> str:
+        """Return fallback prompt when dynamic building fails."""
+# ── Global cache for online/offline detection (60-second TTL) ──
+_online_status_cache = {"status": None, "timestamp": 0}
+_online_status_lock = threading.Lock()
+
+
+def is_online() -> bool:
+    """
+    Detect internet connectivity by attempting connection to 8.8.8.8:53.
+
+    Returns:
+        bool: True if online, False if offline (cached for 60 seconds).
+    """
+    global _online_status_cache
+    current_time = time.time()
+
+    # Check if cache is still valid (< 60 seconds)
+    with _online_status_lock:
+        if _online_status_cache["status"] is not None and current_time - _online_status_cache["timestamp"] < 60:
+            return _online_status_cache["status"]
+
+        # Cache expired or not set; perform connectivity check
+        try:
+            # Try to connect to Google's DNS server
+            socket.create_connection(("8.8.8.8", 53), timeout=1)
+            status = True
+            LOGGER.debug("Internet connectivity detected")
+        except (socket.timeout, socket.error):
+            status = False
+            LOGGER.debug("No internet connectivity detected")
+
+        # Update cache
+        _online_status_cache["status"] = status
+        _online_status_cache["timestamp"] = current_time
+        return status
 
 
 # ══════════════════════════════════════════════════════════
@@ -3033,13 +3622,17 @@ class AIRouter:
         self.animator = animator
         self.gemini = GeminiBrain(config.gemini_api_key, config.history_limit, logger)
         self.groq = GroqBrain(config.groq_api_key, config.history_limit, logger)
+        self.ollama = None
+        self.system_prompt = ""
+        self.last_system_prompt_update = 0
         self.manual_override: Optional[str] = None
         self.active_provider = config.primary_ai
         self.animator.set_provider(self.active_provider)
+        self._online_state_announced = False
 
     def initialize_providers(self) -> Dict[str, bool]:
         """
-        Initialize both AI providers and return readiness flags.
+        Initialize all AI providers and return readiness flags.
 
         Parameters:
             None.
@@ -3050,17 +3643,31 @@ class AIRouter:
         Exceptions:
             This method does not raise exceptions.
         """
-        # ── initialize both providers independently so one can survive without the other ──
+        # ── initialize both cloud providers independently so one can survive without the other ──
         gemini_ready = self.gemini.initialize()
         groq_ready = self.groq.initialize()
-        return {"gemini": gemini_ready, "groq": groq_ready}
+
+        # ── initialize Ollama local provider if enabled ──
+        ollama_ready = False
+        if self.config.local_llm_enabled:
+            try:
+                self.ollama = OllamaProvider(self.config, self.logger)
+                ollama_ready = self.ollama.check_availability()
+                if ollama_ready:
+                    self.logger.info(f"Ollama provider ready: {self.ollama.model_name}")
+                else:
+                    self.logger.warning(f"Ollama not available at {self.ollama.base_url}")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize Ollama: {e}")
+
+        return {"gemini": gemini_ready, "groq": groq_ready, "ollama": ollama_ready}
 
     def provider_display_name(self, provider: str) -> str:
         """
         Convert an internal provider ID to a friendly display name.
 
         Parameters:
-            provider (str): Provider key such as `gemini` or `groq`.
+            provider (str): Provider key such as `gemini`, `groq`, or `ollama`.
 
         Returns:
             str: Human-readable provider label.
@@ -3069,7 +3676,7 @@ class AIRouter:
             This method does not raise exceptions.
         """
         # ── map short provider keys to terminal-friendly names ──
-        return {"gemini": "Gemini", "groq": "Groq"}.get(provider, provider.title())
+        return {"gemini": "Gemini", "groq": "Groq", "ollama": "Ollama"}.get(provider, provider.title())
 
     def is_provider_available(self, provider: str) -> bool:
         """
@@ -3089,6 +3696,8 @@ class AIRouter:
             return self.gemini.available
         if provider == "groq":
             return self.groq.available
+        if provider == "ollama":
+            return self.ollama is not None and self.ollama.available
         return False
 
     def _other_provider(self, provider: str) -> str:
@@ -3145,7 +3754,7 @@ class AIRouter:
         """
         # ── normalize the requested provider name ──
         normalized_provider = provider.strip().lower()
-        if normalized_provider not in {"gemini", "groq"}:
+        if normalized_provider not in {"gemini", "groq", "ollama"}:
             return False, "That is not a supported AI provider, sir."
 
         # ── ensure the requested provider is actually initialized ──
@@ -3181,7 +3790,7 @@ class AIRouter:
 
     def ask(self, user_text: str) -> Tuple[Optional[str], Optional[str]]:
         """
-        Ask the active AI stack for a response, falling back automatically on failure.
+        Ask the active AI stack for a response with 4-tier fallback and offline support.
 
         Parameters:
             user_text (str): The user's request text.
@@ -3192,46 +3801,82 @@ class AIRouter:
         Exceptions:
             This method catches provider failures and returns clean fallback results.
         """
-        # ── compute the order of providers to try for this request ──
-        provider_order = self.get_provider_order()
+        # ── check online/offline status ──
+        online = is_online()
+        if not online and not self._online_state_announced:
+            self.logger.info("Detected offline - using local LLM and skills")
+            self._online_state_announced = True
+        elif online and self._online_state_announced:
+            self.logger.info("Detected online - resuming normal provider rotation")
+            self._online_state_announced = False
 
-        # ── try each provider until one succeeds ──
+        # ── build provider order based on online status and AI_PRIORITY config ──
+        if self.manual_override:
+            provider_order = [self.manual_override]
+        else:
+            # Parse AI_PRIORITY from config
+            provider_order = [p.strip() for p in self.config.ai_priority.split(",")]
+
+            # If offline, prioritize local Ollama
+            if not online and "ollama" in provider_order:
+                # Move ollama to front if offline
+                provider_order = ["ollama"] + [p for p in provider_order if p != "ollama"]
+
+        # ── try each provider in order ──
         for provider_name in provider_order:
-            provider = self.gemini if provider_name == "gemini" else self.groq
-            if not provider.available:
+            provider = None
+            if provider_name == "gemini":
+                provider = self.gemini
+            elif provider_name == "groq":
+                provider = self.groq
+            elif provider_name == "ollama":
+                provider = self.ollama
+            else:
                 continue
 
-            # ── show the current provider in the thinking animation before the API call ──
+            if provider is None:
+                continue
+
+            # ── check availability ──
+            if not self.is_provider_available(provider_name):
+                continue
+
+            # ── show the current provider in the thinking animation ──
             self.animator.set_provider(provider_name)
             self.animator.set_state("thinking", "Thinking...")
 
-            # ── record timing so the database can track provider performance ──
+            # ── record timing ──
             start_time = time.perf_counter()
             try:
-                reply_text, token_count = provider.send_message(user_text)
+                # ── different APIs for different providers ──
+                if provider_name == "ollama":
+                    # For Ollama, just pass the user text directly
+                    reply_text, token_count = provider.send_message(user_text)
+                    if not reply_text:
+                        raise Exception("Ollama returned empty response")
+                else:
+                    # Gemini and Groq
+                    reply_text, token_count = provider.send_message(user_text)
+
                 elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                 self.db_manager.log_ai_usage(provider_name, True, elapsed_ms, token_count)
 
-                # ── log a switch event when the active provider changes ──
+                # ── log a switch event when provider changes ──
                 if self.active_provider != provider_name:
                     self._log_switch(self.active_provider, provider_name, "automatic fallback success")
 
-                # ── update the active provider for terminal display ──
+                # ── update the active provider ──
                 self.active_provider = provider_name
                 self.animator.set_provider(provider_name)
                 return reply_text, provider_name
+
             except Exception as error:
                 elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                 self.db_manager.log_ai_usage(provider_name, False, elapsed_ms, None)
-                self.logger.error("AI request failed for %s: %s", provider_name, error)
-
-                # ── log the fallback handoff if another provider remains to try ──
-                alternate_provider = self._other_provider(provider_name)
-                if provider_name != alternate_provider and self.is_provider_available(alternate_provider):
-                    self._log_switch(provider_name, alternate_provider, "provider failure")
+                self.logger.error(f"AI request failed for {provider_name}: {error}")
                 continue
 
-        # ── signal that both providers were unavailable for this request ──
+        # ── all providers failed or unavailable ──
         self.animator.set_state("error")
         return None, None
 
@@ -3260,6 +3905,196 @@ def format_memory_sentence(memory: Dict[str, Any]) -> str:
     if value.lower().startswith(("is ", "are ", "am ", "was ", "were ")):
         return f"{key} {value}"
     return f"{key}: {value}"
+
+
+def semantic_search_memory(db_manager, query: str, top_k: int = 5, threshold: float = 0.65) -> list:
+    """
+    Search memories using semantic similarity with embeddings.
+
+    Parameters:
+        db_manager: Database manager instance.
+        query (str): Query text to search for.
+        top_k (int): Number of results to return.
+        threshold (float): Minimum similarity score (0-1).
+
+    Returns:
+        list: List of matching memory records with similarity scores.
+    """
+    try:
+        engine = get_embedding_engine()
+        query_embedding = engine.embed(query)
+
+        connection = db_manager._get_connection()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT key, value, category, importance_score,
+                           1 - (embedding <=> %s::vector) as similarity
+                    FROM memory
+                    WHERE embedding IS NOT NULL
+                    ORDER BY similarity DESC
+                    LIMIT %s
+                    """,
+                    (f"[{','.join(map(str, query_embedding))}]", top_k),
+                )
+                rows = cursor.fetchall()
+                results = []
+                for row in rows:
+                    score = row[4] if row[4] else 0
+                    if score >= threshold:
+                        results.append(
+                            {
+                                "key": row[0],
+                                "value": row[1],
+                                "category": row[2],
+                                "importance": row[3],
+                                "similarity": score,
+                            }
+                        )
+                return results
+        finally:
+            db_manager._put_connection(connection)
+    except Exception as error:
+        LOGGER.warning(f"Semantic search failed: {error}")
+        return []
+
+
+def recall_conversation_context(db_manager, query: str, top_k: int = 1) -> str:
+    """
+    Recall conversation context by semantic similarity.
+
+    Parameters:
+        db_manager: Database manager instance.
+        query (str): Query text to search for.
+        top_k (int): Number of results to return.
+
+    Returns:
+        str: Formatted conversation context.
+    """
+    try:
+        engine = get_embedding_engine()
+        query_embedding = engine.embed(query)
+
+        connection = db_manager._get_connection()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT content, role, 1 - (embedding <=> %s::vector) as similarity
+                    FROM conversation_embeddings
+                    WHERE embedding IS NOT NULL
+                    ORDER BY similarity DESC
+                    LIMIT %s
+                    """,
+                    (f"[{','.join(map(str, query_embedding))}]", top_k),
+                )
+                row = cursor.fetchone()
+                if row and row[2] > 0.65:
+                    role = "You said" if row[1] == "user" else "I said"
+                    return f"{role}: {row[0][:100]}"
+                return ""
+        finally:
+            db_manager._put_connection(connection)
+    except Exception as error:
+        LOGGER.warning(f"Conversation context recall failed: {error}")
+        return ""
+
+
+def recall_session_by_date(db_manager, date_str: str) -> str:
+    """
+    Recall session summary by relative date.
+
+    Parameters:
+        db_manager: Database manager instance.
+        date_str (str): Date reference like 'yesterday', 'last week', etc.
+
+    Returns:
+        str: Session summary or empty string if not found.
+    """
+    try:
+        connection = db_manager._get_connection()
+        try:
+            with connection.cursor() as cursor:
+                interval_sql = "1 day"
+                if "week" in date_str:
+                    interval_sql = "7 days"
+                elif "month" in date_str:
+                    interval_sql = "30 days"
+
+                cursor.execute(
+                    f"""
+                    SELECT summary FROM session_summaries
+                    WHERE ended_at > CURRENT_TIMESTAMP - INTERVAL '{interval_sql}'
+                    ORDER BY ended_at DESC
+                    LIMIT 1
+                    """
+                )
+                row = cursor.fetchone()
+                return row[0] if row else ""
+        finally:
+            db_manager._put_connection(connection)
+    except Exception as error:
+        LOGGER.warning(f"Session recall failed: {error}")
+        return ""
+
+
+def format_memory_sentence(memory) -> str:
+    """
+    Format memory dictionary or string into a readable sentence.
+
+    Parameters:
+        memory: Memory record (dict or string).
+
+    Returns:
+        str: Formatted sentence.
+    """
+    if isinstance(memory, dict):
+        value = memory.get("value", memory.get("content", ""))
+    else:
+        value = memory
+    return value if isinstance(value, str) else str(value)
+
+
+def get_embedding_engine():
+    """
+    Get the singleton EmbeddingEngine instance, creating if necessary.
+
+    Returns:
+        EmbeddingEngine: Singleton instance for embeddings.
+    """
+    global _embedding_engine_instance
+    if _embedding_engine_instance is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            _embedding_engine_instance = EmbeddingEngine()
+        except ImportError:
+            LOGGER.error("sentence-transformers not installed; embeddings unavailable")
+    return _embedding_engine_instance
+
+
+def calculate_importance(key: str, value: str, category: str) -> float:
+    """
+    Calculate importance score for a memory.
+
+    Parameters:
+        key (str): Memory key.
+        value (str): Memory value.
+        category (str): Memory category.
+
+    Returns:
+        float: Importance score 0.0-1.0.
+    """
+    score = 0.0
+    if category in ["personal", "preference", "important"]:
+        score += 0.3
+    if len(value) > 50:
+        score += 0.2
+    if any(word in value.lower() for word in ["critical", "important", "remember", "never", "always"]):
+        score += 0.3
+    if key in ["name", "birthday", "email", "phone"]:
+        score += 0.2
+    return min(score, 1.0)
 
 
 def parse_memory_statement(fact_text: str) -> Tuple[str, str, str]:
@@ -4763,6 +5598,586 @@ class CornerTriggerWatcher(threading.Thread):
             self.jarvis_app.speak("Please grant accessibility permissions for corner triggers, sir.")
         except Exception:
             pass
+
+
+# ══════════════════════════════════════════════════════════
+# ██  EMBEDDING ENGINE (PHASE 2)
+# ══════════════════════════════════════════════════════════
+
+_embedding_engine = None
+_embedding_cache = {}
+
+class EmbeddingEngine:
+    """
+    Singleton embedding engine using sentence-transformers.
+    Lazy-loads the model and maintains an LRU cache of embeddings.
+    """
+
+    def __init__(self):
+        """Initialize the embedding engine."""
+        self.model = None
+        self.lock = threading.Lock()
+        self.cache = {}
+        self.max_cache_size = 500
+
+    def _load_model(self):
+        """Lazy-load the sentence transformer model."""
+        if self.model is None:
+            if SentenceTransformer is None:
+                logging.warning("sentence-transformers not available, embeddings disabled")
+                return False
+            try:
+                self.model = SentenceTransformer('all-MiniLM-L6-v2')
+                return True
+            except Exception as e:
+                logging.error(f"Failed to load embedding model: {e}")
+                return False
+        return True
+
+    def embed(self, text: str) -> list:
+        """
+        Embed text using cached model.
+
+        Args:
+            text: Text to embed
+
+        Returns:
+            list: Embedding vector (384-dim) or empty list if failed
+        """
+        if not text or not text.strip():
+            return []
+
+        normalized_text = text.lower().strip()
+
+        with self.lock:
+            # Check cache first
+            if normalized_text in self.cache:
+                return self.cache[normalized_text]
+
+            # Load model if needed
+            if not self._load_model():
+                return []
+
+            # Compute embedding
+            try:
+                embedding = self.model.encode(normalized_text).tolist()
+                # Add to cache, remove oldest if at capacity
+                if len(self.cache) >= self.max_cache_size:
+                    oldest_key = next(iter(self.cache))
+                    del self.cache[oldest_key]
+                self.cache[normalized_text] = embedding
+                return embedding
+            except Exception as e:
+                logging.error(f"Error embedding text: {e}")
+                return []
+
+    def embed_batch(self, texts: list) -> list:
+        """
+        Embed multiple texts efficiently.
+
+        Args:
+            texts: List of texts to embed
+
+        Returns:
+            list: List of embedding vectors
+        """
+        if not texts or not self._load_model():
+            return [[] for _ in texts]
+
+        try:
+            embeddings = self.model.encode(texts)
+            return embeddings.tolist() if hasattr(embeddings, 'tolist') else embeddings
+        except Exception as e:
+            logging.error(f"Error batch embedding: {e}")
+            return [[] for _ in texts]
+
+    @staticmethod
+    def cosine_similarity(vec1: list, vec2: list) -> float:
+        """
+        Calculate cosine similarity between two vectors.
+
+        Args:
+            vec1: First vector
+            vec2: Second vector
+
+        Returns:
+            float: Similarity score 0-1
+        """
+        if not vec1 or not vec2:
+            return 0.0
+        try:
+            import numpy as np
+            v1 = np.array(vec1)
+            v2 = np.array(vec2)
+            dot = np.dot(v1, v2)
+            norm1 = np.linalg.norm(v1)
+            norm2 = np.linalg.norm(v2)
+            if norm1 > 0 and norm2 > 0:
+                return float(dot / (norm1 * norm2))
+        except Exception:
+            pass
+        return 0.0
+
+def get_embedding_engine() -> EmbeddingEngine:
+    """Get or create the singleton embedding engine."""
+    global _embedding_engine
+    if _embedding_engine is None:
+        _embedding_engine = EmbeddingEngine()
+    return _embedding_engine
+
+
+# ══════════════════════════════════════════════════════════
+# ██  OLLAMA PROVIDER (PHASE 2)
+# ══════════════════════════════════════════════════════════
+
+class OllamaProvider:
+    """
+    Local LLM provider using Ollama for offline AI capabilities.
+    """
+
+    def __init__(self, base_url: str, model: str, timeout: int = 30):
+        """
+        Initialize Ollama provider.
+
+        Args:
+            base_url: Ollama server URL (default: http://localhost:11434)
+            model: Model name to use (e.g., 'phi3:mini')
+            timeout: Request timeout in seconds
+        """
+        self.base_url = base_url
+        self.model = model
+        self.timeout = timeout
+        self.conversation_history = []
+        self.max_history = 10
+
+    def is_available(self) -> bool:
+        """
+        Check if Ollama is running and model is available.
+
+        Returns:
+            bool: True if Ollama is accessible
+        """
+        try:
+            response = requests.get(f"{self.base_url}/api/tags", timeout=2)
+            if response.status_code == 200:
+                # Check if our model is in the list
+                data = response.json()
+                models = data.get('models', [])
+                for m in models:
+                    if m.get('name') == self.model or m.get('name').startswith(self.model + ":"):
+                        return True
+                logging.warning(f"Ollama model '{self.model}' not found. Available: {[m.get('name') for m in models]}")
+                return False
+            return False
+        except Exception as e:
+            logging.debug(f"Ollama not available: {e}")
+            return False
+
+    def generate(self, prompt: str, system_prompt: str = "") -> str:
+        """
+        Generate response from Ollama.
+
+        Args:
+            prompt: User prompt
+            system_prompt: System prompt for personality
+
+        Returns:
+            str: Generated response or empty string if failed
+        """
+        if requests is None:
+            return ""
+
+        try:
+            # Build messages with conversation history
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+
+            # Add recent history
+            for turn in self.conversation_history[-self.max_history:]:
+                messages.append(turn)
+
+            # Add current prompt
+            messages.append({"role": "user", "content": prompt})
+
+            # Call Ollama API
+            response = requests.post(
+                f"{self.base_url}/api/chat",
+                json={"model": self.model, "messages": messages, "stream": False},
+                timeout=self.timeout
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                assistant_message = result.get("message", {}).get("content", "").strip()
+
+                # Update history
+                self.conversation_history.append({"role": "user", "content": prompt})
+                self.conversation_history.append({"role": "assistant", "content": assistant_message})
+
+                # Trim history to max_history window
+                if len(self.conversation_history) > self.max_history * 2:
+                    self.conversation_history = self.conversation_history[-(self.max_history * 2):]
+
+                return assistant_message
+            else:
+                logging.error(f"Ollama API error: {response.status_code}")
+                return ""
+
+        except requests.exceptions.Timeout:
+            logging.warning(f"Ollama timeout (>{self.timeout}s), falling back to next provider")
+            return ""
+        except Exception as e:
+            logging.error(f"Ollama generation error: {e}")
+            return ""
+
+    def reset_history(self):
+        """Clear conversation history."""
+        self.conversation_history = []
+
+
+# ══════════════════════════════════════════════════════════
+# ██  ONLINE/OFFLINE DETECTION (PHASE 2)
+# ══════════════════════════════════════════════════════════
+
+_last_online_check = 0
+_last_online_state = True
+
+def is_online(cache_seconds: int = 60) -> bool:
+    """
+    Check if system has internet connectivity.
+
+    Args:
+        cache_seconds: Cache result for this many seconds
+
+    Returns:
+        bool: True if online
+    """
+    global _last_online_check, _last_online_state
+
+    now = time.time()
+    if now - _last_online_check < cache_seconds:
+        return _last_online_state
+
+    try:
+        # Try to connect to Google DNS
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 53))
+            result = True
+    except Exception:
+        result = False
+
+    _last_online_check = now
+    _last_online_state = result
+    return result
+
+
+# ══════════════════════════════════════════════════════════
+# ██  SEMANTIC MEMORY SYSTEM (PHASE 2)
+# ══════════════════════════════════════════════════════════
+
+def calculate_importance(key: str, value: str, category: str) -> float:
+    """
+    Calculate importance score for a memory.
+
+    Args:
+        key: Memory key
+        value: Memory value
+        category: Memory category
+
+    Returns:
+        float: Importance score 0.0-1.0
+    """
+    import re
+
+    # Never store secrets
+    if any(keyword in key.lower() for keyword in ['password', 'secret', 'token', 'key']):
+        return 0.0
+
+    # Base score by category
+    scores = {
+        "personal": 0.9,
+        "project": 0.8,
+        "preference": 0.7,
+        "fact": 0.5,
+        "general": 0.4
+    }
+    score = scores.get(category, 0.5)
+
+    # Bonus for detailed memories
+    if len(value) > 200:
+        score += 0.1
+
+    # Bonus for time-anchored memories
+    if re.search(r'\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}', value):
+        score += 0.1
+
+    return min(1.0, score)
+
+def semantic_search_memory(db_manager, query: str, top_k: int = 5, threshold: float = 0.65) -> list:
+    """
+    Search memories using semantic similarity.
+
+    Args:
+        db_manager: DatabaseManager instance
+        query: Search query
+        top_k: Number of results to return
+        threshold: Minimum similarity threshold
+
+    Returns:
+        list: List of matching memory dicts
+    """
+    engine = get_embedding_engine()
+    query_embedding = engine.embed(query)
+    if not query_embedding:
+        return []
+
+    connection = db_manager._get_connection()
+    try:
+        with connection.cursor() as cursor:
+            # Search using vector similarity
+            cursor.execute("""
+                SELECT id, key, value, category, importance_score,
+                       1 - (embedding <=> %s::vector) as similarity
+                FROM memory
+                WHERE embedding IS NOT NULL
+                  AND 1 - (embedding <=> %s::vector) > %s
+                ORDER BY similarity DESC
+                LIMIT %s
+            """, (query_embedding, query_embedding, threshold, top_k))
+
+            results = []
+            for row in cursor.fetchall():
+                r = {
+                    'id': row[0],
+                    'key': row[1],
+                    'value': row[2],
+                    'category': row[3],
+                    'importance_score': row[4],
+                    'similarity': row[5]
+                }
+                results.append(r)
+
+                # Update last_accessed
+                cursor.execute("""
+                    UPDATE memory SET last_accessed = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                """, (row[0],))
+
+            connection.commit()
+            return results
+
+    except Exception as e:
+        logging.error(f"Semantic search error: {e}")
+        return []
+    finally:
+        db_manager._put_connection(connection)
+
+def recall_conversation_context(db_manager, query: str, top_k: int = 3) -> str:
+    """
+    Find relevant past conversation context.
+
+    Args:
+        db_manager: DatabaseManager instance
+        query: Search query
+        top_k: Number of results
+
+    Returns:
+        str: Formatted context string
+    """
+    engine = get_embedding_engine()
+    query_embedding = engine.embed(query)
+    if not query_embedding:
+        return ""
+
+    connection = db_manager._get_connection()
+    try:
+        with connection.cursor() as cursor:
+            # Search conversation embeddings from last 30 days
+            cursor.execute("""
+                SELECT role, content, timestamp
+                FROM conversation_embeddings
+                WHERE embedding IS NOT NULL
+                  AND timestamp > CURRENT_TIMESTAMP - INTERVAL '30 days'
+                  AND 1 - (embedding <=> %s::vector) > 0.70
+                ORDER BY 1 - (embedding <=> %s::vector) DESC
+                LIMIT %s
+            """, (query_embedding, query_embedding, top_k))
+
+            turns = cursor.fetchall()
+            if not turns:
+                return ""
+
+            context_parts = ["Previously, we discussed:"]
+            for role, content, ts in turns:
+                time_str = ts.strftime("%b %d") if ts else "earlier"
+                if role == "user":
+                    context_parts.append(f"You asked ({time_str}): {content[:100]}")
+                else:
+                    context_parts.append(f"I responded: {content[:100]}")
+
+            return "\n".join(context_parts)
+
+    except Exception as e:
+        logging.error(f"Conversation context recall error: {e}")
+        return ""
+    finally:
+        db_manager._put_connection(connection)
+
+def recall_session_by_date(db_manager, date_str: str) -> str:
+    """
+    Recall a session summary by relative date.
+
+    Args:
+        db_manager: DatabaseManager instance
+        date_str: Relative date like "yesterday", "last Monday", "2 days ago"
+
+    Returns:
+        str: Session summary or empty string
+    """
+    try:
+        if dateutil_parser is None:
+            return ""
+
+        target_date = dateutil_parser.parse(date_str).date()
+    except Exception:
+        return ""
+
+    connection = db_manager._get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT summary, message_count, started_at, ended_at
+                FROM session_summaries
+                WHERE DATE(ended_at) = %s
+                ORDER BY ended_at DESC
+                LIMIT 1
+            """, (target_date,))
+
+            row = cursor.fetchone()
+            if row:
+                summary, msg_count, start, end = row
+                return f"Session {start.strftime('%I:%M %p')}: {summary} ({msg_count} messages)"
+            return ""
+
+    except Exception as e:
+        logging.error(f"Session recall error: {e}")
+        return ""
+    finally:
+        db_manager._put_connection(connection)
+
+def inject_context_into_prompt(db_manager, current_command: str, max_tokens: int = 500) -> str:
+    """
+    Inject relevant context from memory before AI call.
+
+    Args:
+        db_manager: DatabaseManager instance
+        current_command: User's current command
+        max_tokens: Maximum tokens to include (rough estimate)
+
+    Returns:
+        str: Context string to prepend to system prompt
+    """
+    parts = []
+
+    # Search semantic memory
+    memories = semantic_search_memory(db_manager, current_command, top_k=3, threshold=0.60)
+    if memories:
+        mem_strs = [f"{m['key']}: {m['value'][:80]}" for m in memories]
+        parts.append("Relevant memories: " + "\n".join(mem_strs))
+
+    # Search conversation context
+    context = recall_conversation_context(db_manager, current_command, top_k=2)
+    if context:
+        parts.append(context)
+
+    full_context = "\n".join(parts)
+
+    # Enforce max tokens (rough estimate: 1 word ≈ 4 chars)
+    estimated_tokens = len(full_context) // 4
+    if estimated_tokens > max_tokens:
+        full_context = full_context[:max_tokens * 4]
+
+    return full_context if full_context else ""
+
+
+# ══════════════════════════════════════════════════════════
+# ██  SYSTEM PROMPT BUILDER (PHASE 2)
+# ══════════════════════════════════════════════════════════
+
+def build_dynamic_system_prompt(db_manager) -> str:
+    """
+    Build personalized system prompt using user data and context.
+
+    Args:
+        db_manager: DatabaseManager instance
+
+    Returns:
+        str: Complete system prompt
+    """
+    parts = []
+
+    # 1. Static JARVIS identity
+    parts.append("""You are JARVIS, a highly advanced personal AI assistant. You are precise,
+intelligent, occasionally witty, and always address the user as sir. You give concise
+answers unless asked for detail. Never say you are an AI or mention your model name.
+Respond as JARVIS would - professional but personable.""")
+
+    # 2. User profile
+    connection = db_manager._get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT key, value FROM user_profile LIMIT 20")
+            profile = {row[0]: row[1] for row in cursor.fetchall()}
+    except Exception:
+        profile = {}
+    finally:
+        db_manager._put_connection(connection)
+
+    if profile:
+        name = profile.get('name', 'sir')
+        response_length = profile.get('response_length', 'concise')
+        style = profile.get('style', 'casual')
+        parts.append(f"""User Profile:
+- Preferred response length: {response_length}
+- Communication style: {style}"""
+)
+
+    # 3. Time context
+    now = datetime.datetime.now()
+    hour = now.hour
+    if 5 <= hour < 12:
+        time_context = "Morning (user typically checks news and emails)"
+    elif 12 <= hour < 17:
+        time_context = "Afternoon (user typically works on coding projects)"
+    elif 17 <= hour < 22:
+        time_context = "Evening (user typically does deep work or research)"
+    else:
+        time_context = "Night (user may be coding or winding down)"
+
+    parts.append(f"Current time context: {now.strftime('%I:%M %p, %A')} - {time_context}")
+
+    # 4. Recent projects (simplified, no embeddings overhead)
+    try:
+        connection = db_manager._get_connection()
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT friendly_name, project_type
+                FROM project_registry
+                ORDER BY last_opened DESC NULLS LAST
+                LIMIT 3
+            """)
+            projects = cursor.fetchall()
+            if projects:
+                proj_str = ", ".join(f"{p[0]} ({p[1]})" for p in projects)
+                parts.append(f"Active projects: {proj_str}")
+    except Exception:
+        pass
+    finally:
+        if connection:
+            db_manager._put_connection(connection)
+
+    return "\n".join(parts)
 
 
 # ══════════════════════════════════════════════════════════
@@ -6723,23 +8138,131 @@ class JarvisApp:
             if not fact_text:
                 return True, "Please tell me what you would like me to remember, sir.", False
             memory_key, memory_value, category = parse_memory_statement(fact_text)
+            importance = calculate_importance(memory_key, memory_value, category)
+            # Store with embedding for Phase 2
+            try:
+                engine = get_embedding_engine()
+                embedding = engine.embed(memory_value) if engine else None
+            except Exception:
+                embedding = None
             if self.db_manager.save_memory(memory_key, memory_value, category):
                 return True, f"I will remember that {fact_text}, sir.", False
             return True, "I could not store that memory, sir.", False
 
+        # PHASE 2: Semantic memory recall
         if lowered_command.startswith("do you remember "):
-            lookup_key = cleaned_command[len("do you remember ") :].strip().rstrip("?")
-            memory = self.db_manager.recall_memory(lookup_key)
+            query = cleaned_command[len("do you remember ") :].strip().rstrip("?")
+            # Try semantic search first
+            try:
+                engine = get_embedding_engine()
+                if engine:
+                    results = semantic_search_memory(self.db_manager, query, top_k=1, threshold=0.60)
+                    if results:
+                        mem = results[0]
+                        return True, f"Yes, sir. I remember that {format_memory_sentence(mem)}.", False
+            except Exception:
+                pass
+            # Fallback to literal search
+            memory = self.db_manager.recall_memory(query)
             if memory:
                 return True, f"Yes, sir. I remember that {format_memory_sentence(memory)}.", False
-            return True, f"I do not remember anything about {lookup_key}, sir.", False
+            return True, f"I do not remember anything about {query}, sir.", False
 
+        # PHASE 2: Combined knowledge recall
         if lowered_command.startswith("what do you know about "):
-            lookup_key = cleaned_command[len("what do you know about ") :].strip().rstrip("?")
-            memory = self.db_manager.recall_memory(lookup_key)
-            if memory:
-                return True, f"I remember that {format_memory_sentence(memory)}.", False
-            return True, f"I do not know anything about {lookup_key} yet, sir.", False
+            query = cleaned_command[len("what do you know about ") :].strip().rstrip("?")
+            response_parts = []
+            # Get memory results
+            try:
+                engine = get_embedding_engine()
+                if engine:
+                    mem_results = semantic_search_memory(self.db_manager, query, top_k=2, threshold=0.60)
+                    if mem_results:
+                        for mem in mem_results:
+                            response_parts.append(f"I remember that {format_memory_sentence(mem)}")
+                    # Get conversation context
+                    conv_context = recall_conversation_context(self.db_manager, query, top_k=1)
+                    if conv_context:
+                        response_parts.append(conv_context)
+            except Exception:
+                pass
+            if response_parts:
+                return True, " Also, ".join(response_parts) + ", sir.", False
+            return True, f"I do not know anything about {query} yet, sir.", False
+
+        # PHASE 2: Recall by date
+        if "what did we talk about" in lowered_command and ("yesterday" in lowered_command or "last" in lowered_command or "ago" in lowered_command):
+            # Extract date reference
+            if "yesterday" in lowered_command:
+                date_str = "yesterday"
+            else:
+                # Try to extract relative date
+                match = re.search(r"(last \w+|\d+ days? ago)", lowered_command)
+                date_str = match.group(1) if match else "yesterday"
+            try:
+                summary = recall_session_by_date(self.db_manager, date_str)
+                if summary:
+                    return True, f"{summary}, sir.", False
+            except Exception:
+                pass
+            return True, f"I do not have a record of our conversation from {date_str}, sir.", False
+
+        # PHASE 2: Week summary
+        if "summarize this week" in lowered_command:
+            connection = self.db_manager._get_connection()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT summary FROM session_summaries
+                        WHERE ended_at > CURRENT_TIMESTAMP - INTERVAL '7 days'
+                        ORDER BY ended_at DESC
+                        LIMIT 5
+                    """)
+                    rows = cursor.fetchall()
+                    if rows:
+                        summaries = [row[0] for row in rows if row[0]]
+                        response = "This week's sessions: " + " ".join(summaries[:3])
+                        return True, response + ", sir.", False
+            except Exception:
+                pass
+            finally:
+                self.db_manager._put_connection(connection)
+            return True, "I do not have any session summaries from this week, sir.", False
+
+        # PHASE 2: Last session
+        if "what was the last thing" in lowered_command or "last thing you helped" in lowered_command:
+            connection = self.db_manager._get_connection()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT summary FROM session_summaries
+                        ORDER BY ended_at DESC
+                        LIMIT 1
+                    """)
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        return True, f"The last thing I helped with was: {row[0]}, sir.", False
+            except Exception:
+                pass
+            finally:
+                self.db_manager._put_connection(connection)
+            return True, "I do not have a record of our last session, sir.", False
+
+        # PHASE 2: Forget memory
+        if lowered_command.startswith("forget "):
+            topic = cleaned_command[len("forget ") :].strip()
+            if self.ask_confirmation(f"Are you sure you want me to forget about {topic}? Say yes to confirm."):
+                connection = self.db_manager._get_connection()
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute("DELETE FROM memory WHERE key ILIKE %s", (f"%{topic}%",))
+                    connection.commit()
+                    return True, f"I have forgotten about {topic}, sir.", False
+                except Exception:
+                    pass
+                finally:
+                    self.db_manager._put_connection(connection)
+            return True, "Forget operation cancelled, sir.", False
 
         if lowered_command in {"what do you remember", "list your memories"}:
             return True, self.db_manager.recall_all_memories(), False
@@ -6750,6 +8273,10 @@ class JarvisApp:
 
         if any(pattern in lowered_command for pattern in ["switch to gemini", "use gemini"]):
             _, response_text = self.ai_router.switch_ai("gemini")
+            return True, response_text, False
+
+        if any(pattern in lowered_command for pattern in ["switch to ollama", "use ollama", "use local"]):
+            _, response_text = self.ai_router.switch_ai("ollama")
             return True, response_text, False
 
         return False, "", False
@@ -7172,6 +8699,12 @@ class JarvisApp:
         self.logger.info("Session ended. Session ID: %s", self.session_id)
         self.db_manager.log_conversation(self.session_id, "system", "Session ended", None)
 
+        # ── generate and store session summary for Phase 2 semantic recall ──
+        try:
+            self._summarize_session()
+        except Exception as error:
+            self.logger.warning(f"Failed to summarize session: {error}")
+
         # ── signal all background threads to stop their loops ──
         self.stop_background_threads.set()
 
@@ -7206,6 +8739,134 @@ class JarvisApp:
         # ── stop animation, clear the line, and print the final offline message ──
         self.animator.stop()
         print("JARVIS offline.")
+
+    def _summarize_session(self) -> None:
+        """
+        Generate and store a summary of the session for Phase 2 semantic recall.
+
+        Parameters:
+            None.
+
+        Returns:
+            None.
+
+        Exceptions:
+            Catches all exceptions to ensure cleanup continues.
+        """
+        try:
+            # ── fetch conversation log for this session ──
+            connection = self.db_manager._get_connection()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT role, content FROM conversation_log
+                        WHERE session_id = %s
+                        ORDER BY timestamp ASC
+                        LIMIT 100
+                        """,
+                        (self.session_id,),
+                    )
+                    rows = cursor.fetchall()
+                    if not rows:
+                        return
+
+                    # ── format conversation for summarization ──
+                    conversation_text = "\n".join(
+                        [f"{row[0].upper()}: {row[1]}" for row in rows if row[1]]
+                    )
+            finally:
+                self.db_manager._put_connection(connection)
+
+            # ── request summary from Ollama if available ──
+            summary_text = None
+            if self.ai_router.ollama and self.ai_router.ollama.available:
+                try:
+                    summary_prompt = (
+                        f"Summarize this conversation in exactly 3 sentences. "
+                        f"Focus on: what was accomplished, what was discussed, any decisions made.\n\n"
+                        f"{conversation_text[:2000]}"  # Limit input to prevent token overflow
+                    )
+                    summary_text, _ = self.ai_router.ollama.send_message(summary_prompt)
+                    if not summary_text:
+                        summary_text = None
+                except Exception as error:
+                    self.logger.debug(f"Ollama summarization failed: {error}")
+                    summary_text = None
+
+            # ── fallback: generate simple summary if Ollama unavailable ──
+            if not summary_text:
+                # Simple fallback: count user turns and get time duration
+                user_turn_count = sum(1 for row in rows if row[0] == "user")
+                duration_mins = int((time.time() - self.started_at) / 60)
+                summary_text = f"Conducted {user_turn_count} interactions over {duration_mins} minutes. Session completed successfully."
+
+            # ── extract topics using simple keyword detection ──
+            topics = self._extract_session_topics(conversation_text)
+
+            # ── generate embedding for summary ──
+            try:
+                engine = get_embedding_engine()
+                summary_embedding = engine.embed(summary_text) if engine else None
+            except Exception:
+                summary_embedding = None
+
+            # ── store session summary in database ──
+            connection = self.db_manager._get_connection()
+            try:
+                with connection.cursor() as cursor:
+                    # Convert embedding list to PostgreSQL format
+                    embedding_sql = "NULL"
+                    if summary_embedding:
+                        embedding_sql = f"'[{','.join(map(str, summary_embedding))}]'::vector"
+
+                    cursor.execute(
+                        f"""
+                        INSERT INTO session_summaries
+                        (session_id, summary, topics, embedding, message_count, started_at, ended_at)
+                        VALUES (%s, %s, %s, {embedding_sql}, %s, %s, NOW())
+                        """,
+                        (
+                            self.session_id,
+                            summary_text,
+                            ",".join(topics[:5]),  # Top 5 topics
+                            len(rows),
+                            datetime.datetime.fromtimestamp(self.started_at),
+                        ),
+                    )
+                connection.commit()
+                self.logger.info(f"Session {self.session_id} summarized: {len(summary_text)} chars, {len(topics)} topics")
+            finally:
+                self.db_manager._put_connection(connection)
+
+        except Exception as error:
+            self.logger.warning(f"Session summarization error: {error}")
+
+    def _extract_session_topics(self, conversation_text: str) -> list:
+        """
+        Extract topics from conversation text using simple keyword detection.
+
+        Parameters:
+            conversation_text (str): Full conversation text.
+
+        Returns:
+            list: List of extracted topic strings.
+        """
+        topics = []
+        try:
+            # Simple keyword detection - look for capital words and common topics
+            words = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", conversation_text)
+            topic_freq = {}
+            for word in words:
+                if len(word) > 3:  # Only longer words
+                    topic_freq[word] = topic_freq.get(word, 0) + 1
+
+            # Sort by frequency and take top topics
+            topics = sorted(topic_freq.items(), key=lambda x: x[1], reverse=True)
+            topics = [topic[0] for topic in topics[:10]]  # Top 10 topics
+        except Exception:
+            pass
+        return topics if topics else ["general"]
 
     def run(self) -> int:
         """
